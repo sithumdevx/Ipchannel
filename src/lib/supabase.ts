@@ -31,6 +31,33 @@ export const isSupabaseConfigured = (): boolean => {
 let clientInstance: SupabaseClient | null = null;
 
 /**
+ * Session cookie hardening applied to both browser and server-created clients:
+ *  - `sameSite: "lax"` keeps the session cookie off cross-site requests (CSRF)
+ *  - `secure` on HTTPS (and on loopback, which browsers treat as trustworthy)
+ *  - explicit path + bounded lifetime (30 days, matching Supabase's refresh
+ *    token lifetime) so a stale cookie can't outlive its refresh token
+ *
+ * Note: `httpOnly` stays false because @supabase/ssr stores the session in a
+ * cookie the client JS must read; the real access boundary is Supabase RLS.
+ */
+function sessionCookieOptions() {
+  const isLoopback =
+    typeof window !== "undefined" &&
+    ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+  const isSecure =
+    typeof window === "undefined" ||
+    window.location.protocol === "https:" ||
+    isLoopback;
+
+  return {
+    sameSite: "lax" as const,
+    path: "/",
+    maxAge: 60 * 60 * 24 * 30, // 30 days
+    secure: isSecure,
+  };
+}
+
+/**
  * Returns a single shared instance of the Supabase browser client
  * Prevents multiple GoTrueClient instances in the browser context
  *
@@ -49,12 +76,12 @@ export const getSupabase = (): SupabaseClient | null => {
   try {
     // On the server, always create a fresh client
     if (typeof window === "undefined") {
-      return createBrowserClient(url, key);
+      return createBrowserClient(url, key, { cookieOptions: sessionCookieOptions() });
     }
 
     // In the browser, reuse the single singleton instance
     if (!clientInstance) {
-      clientInstance = createBrowserClient(url, key);
+      clientInstance = createBrowserClient(url, key, { cookieOptions: sessionCookieOptions() });
     }
 
     return clientInstance;

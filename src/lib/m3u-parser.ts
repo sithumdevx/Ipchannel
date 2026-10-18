@@ -215,16 +215,24 @@ export function parseM3U(m3uContent: string): Channel[] {
 }
 
 /**
- * Fetches playlist(s) and parses all valid channels
+ * Fetches playlist(s) and parses all valid channels.
+ *
+ * `url` defaults to the first entry of the `STREAM_SOURCES` env var (a
+ * comma-separated list of M3U/M3U8 URLs). When no source is configured we
+ * fall back to the built-in verified channel set.
  */
-export async function fetchAndParseM3U(
-  url: string = "https://iptv-org.github.io/iptv/index.m3u"
-): Promise<Channel[]> {
+export async function fetchAndParseM3U(url?: string): Promise<Channel[]> {
+  const source = url ?? process.env.STREAM_SOURCES?.split(",")[0]?.trim();
+  if (!source) {
+    console.warn("No STREAM_SOURCES configured, using built-in verified channels.");
+    return FALLBACK_CHANNELS;
+  }
+
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 25000); // 25s timeout
 
-    const response = await fetch(url, {
+    const response = await fetch(source, {
       signal: controller.signal,
       headers: {
         "User-Agent":
@@ -249,7 +257,7 @@ export async function fetchAndParseM3U(
 
     return parsed;
   } catch (error) {
-    console.warn("Failed to fetch live M3U playlist from iptv-org, using fallback verified channels:", error);
+    console.warn("Failed to fetch the live M3U playlist, using fallback verified channels:", error);
     return FALLBACK_CHANNELS;
   }
 }

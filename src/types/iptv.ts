@@ -7,6 +7,13 @@ export interface Channel {
   country?: string;
   language?: string;
   resolution?: string;
+  /**
+   * Stream health, as determined by the 5-minute verifier.
+   * `true` — probed recently and responding; `false` — confirmed dead (such
+   * channels are filtered out of responses entirely); `undefined` — not yet
+   * verified for this request cycle.
+   */
+  isLive?: boolean;
 }
 
 export interface ChannelFilterOptions {

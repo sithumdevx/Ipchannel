@@ -21,6 +21,8 @@ import {
   Zap,
 } from "lucide-react";
 import { Channel } from "@/types/iptv";
+import { countryFlag, countryLabel } from "@/lib/countries";
+import { cleanChannelTitle } from "@/lib/channel-display";
 
 interface VideoPlayerProps {
   channel: Channel;
@@ -435,7 +437,7 @@ export default function VideoPlayer({
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-white font-semibold text-base leading-tight drop-shadow">
-                {channel.name}
+                {cleanChannelTitle(channel.name)}
               </h2>
               <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
@@ -447,7 +449,9 @@ export default function VideoPlayer({
               {channel.country && (
                 <>
                   <span>•</span>
-                  <span>{channel.country}</span>
+                  <span>
+                    {countryFlag(channel.country)} {countryLabel(channel.country)}
+                  </span>
                 </>
               )}
               {autoResolution && currentQuality === -1 && (

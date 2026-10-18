@@ -1,8 +1,10 @@
 "use client";
 
 import React, { useState } from "react";
-import { Play, Heart, Radio, Tv } from "lucide-react";
+import { Play, Heart, Radio } from "lucide-react";
 import { Channel } from "@/types/iptv";
+import { countryFlag, countryLabel } from "@/lib/countries";
+import { cleanChannelTitle } from "@/lib/channel-display";
 
 interface ChannelCardProps {
   channel: Channel;
@@ -12,6 +14,14 @@ interface ChannelCardProps {
   onToggleFavorite: (channelId: string, e: React.MouseEvent) => void;
 }
 
+/**
+ * Channel tile used across the browse grid and carousels.
+ *
+ * Carries a pulsing **LIVE** badge driven by the 5-minute stream verifier
+ * (`channel.isLive`): a green ringed dot that breathes while the stream is
+ * confirmed reachable. Channels not yet verified show a quieter amber "check"
+ * state rather than claiming to be live.
+ */
 export default function ChannelCard({
   channel,
   isActive,
@@ -29,27 +39,63 @@ export default function ChannelCard({
     .join("")
     .toUpperCase() || "TV";
 
+  // `undefined` = not probed yet this cycle; `true` = confirmed reachable.
+  const live = channel.isLive === true;
+  const unverified = channel.isLive === undefined;
+
   return (
     <div
       onClick={() => onSelect(channel)}
       className={`group relative flex flex-col justify-between p-3.5 rounded-2xl cursor-pointer transition-all duration-300 backdrop-blur-md border ${
         isActive
-          ? "bg-gradient-to-b from-cyan-950/40 to-slate-900/90 border-cyan-500 shadow-lg shadow-cyan-500/20 scale-[1.02]"
-          : "bg-slate-900/60 hover:bg-slate-800/80 border-slate-800/80 hover:border-slate-700/80 hover:shadow-xl hover:shadow-black/40 hover:-translate-y-1"
+          ? "bg-gradient-to-b from-cyan-950/40 to-card border-cyan-500 shadow-lg shadow-cyan-500/20 scale-[1.02]"
+          : "bg-card/70 hover:bg-card border-line hover:border-line2 hover:shadow-xl hover:shadow-shadow hover:-translate-y-1"
       }`}
     >
-      {/* Top action row: Category tag & Favorite Heart */}
+      {/* Top action row: Category tag, LIVE badge & Favorite Heart */}
       <div className="flex items-center justify-between gap-1 mb-3">
-        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-800/90 text-slate-300 border border-slate-700/60 max-w-[120px] truncate">
-          {channel.category || "General"}
-        </span>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-chip text-dim border border-line max-w-[100px] truncate">
+            {channel.category || "General"}
+          </span>
+
+          {/* Live status indicator — refreshed by the periodic health poll */}
+          <span
+            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold tracking-wide border ${
+              live
+                ? "bg-emerald-500/12 text-emerald-500 dark:text-emerald-400 border-emerald-500/30"
+                : unverified
+                  ? "bg-amber-500/10 text-amber-500 dark:text-amber-400 border-amber-500/30"
+                  : "bg-rose-500/10 text-rose-500 dark:text-rose-400 border-rose-500/30"
+            }`}
+            title={
+              live
+                ? "Stream verified within the last 5 minutes"
+                : unverified
+                  ? "Verification pending"
+                  : "Stream currently unreachable"
+            }
+          >
+            <span className="relative flex h-1.5 w-1.5">
+              {live && (
+                <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-500 animate-live-ring" />
+              )}
+              <span
+                className={`relative inline-flex h-1.5 w-1.5 rounded-full ${
+                  live ? "bg-emerald-500" : unverified ? "bg-amber-500" : "bg-rose-500"
+                } ${live ? "animate-pulse" : ""}`}
+              />
+            </span>
+            {live ? "LIVE" : unverified ? "CHECK" : "OFFLINE"}
+          </span>
+        </div>
 
         <button
           onClick={(e) => onToggleFavorite(channel.id, e)}
           className={`p-1.5 rounded-xl transition backdrop-blur-sm ${
             isFavorite
               ? "text-rose-500 bg-rose-500/10 hover:bg-rose-500/20"
-              : "text-slate-400 hover:text-rose-400 hover:bg-white/5"
+              : "text-dim hover:text-rose-400 hover:bg-glass"
           }`}
           title={isFavorite ? "Remove from Favorites" : "Add to Favorites"}
         >
@@ -109,16 +155,18 @@ export default function ChannelCard({
       <div className="mt-auto">
         <h3
           className={`font-semibold text-xs leading-snug line-clamp-1 transition ${
-            isActive ? "text-cyan-300" : "text-slate-200 group-hover:text-white"
+            isActive ? "text-cyan-300" : "text-ink group-hover:text-ink"
           }`}
           title={channel.name}
         >
-          {channel.name}
+          {cleanChannelTitle(channel.name)}
         </h3>
 
-        <div className="flex items-center justify-between text-[11px] text-slate-400 mt-1">
-          <span className="truncate">{channel.country || "Global"}</span>
-          <span className="flex items-center gap-1 text-[10px] text-emerald-400/90 font-medium">
+        <div className="flex items-center justify-between text-[11px] text-dim mt-1">
+          <span className="truncate">
+            {channel.country ? `${countryFlag(channel.country)} ${countryLabel(channel.country)}` : "🌐 Global"}
+          </span>
+          <span className="flex items-center gap-1 text-[10px] text-emerald-500 dark:text-emerald-400/90 font-medium">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
             HLS
           </span>

@@ -19,19 +19,26 @@ import {
   Sparkles,
   ChevronLeft,
   ChevronRight,
-  Globe,
-  Radio,
-  ExternalLink,
+  Eye,
   X,
   ArrowUp,
-  User,
   History,
   Home,
 } from "lucide-react";
 import VideoPlayer from "@/components/VideoPlayer";
 import ChannelCard from "@/components/ChannelCard";
+import AuthGate from "@/components/AuthGate";
+import ThemeToggle from "@/components/ThemeToggle";
+import CountryFilter from "@/components/CountryFilter";
 import { Channel, ChannelsApiResponse } from "@/types/iptv";
 import { FALLBACK_CHANNELS } from "@/lib/m3u-parser";
+import { countryFlag, countryLabel, matchesCountry } from "@/lib/countries";
+import {
+  cleanChannelTitle,
+  formatViewers,
+  ratingFor,
+  viewerCountFor,
+} from "@/lib/channel-display";
 import { useProfile } from "@/context/ProfileContext";
 
 const CHUNK_SIZE = 72;
@@ -53,10 +60,11 @@ function WatchContent() {
   const searchParams = useSearchParams();
   const initialChannelId = searchParams.get("channel");
   const initialCategory = searchParams.get("category");
+  const initialCountry = searchParams.get("country");
 
   const {
     currentProfile,
-    setIsAuthModalOpen,
+    openAuthModal,
     toggleFavorite,
     addToHistory,
   } = useProfile();
@@ -70,8 +78,11 @@ function WatchContent() {
   // Filters
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [selectedCategory, setSelectedCategory] = useState<string>(initialCategory || "All");
-  const [selectedCountry, setSelectedCountry] = useState<string>("All");
+  const [selectedCountry, setSelectedCountry] = useState<string>(initialCountry || "All");
   const [filterMode, setFilterMode] = useState<"all" | "favorites" | "history">("all");
+
+  // Live viewer counter — nudged every few seconds so the status bar feels active
+  const [viewerTick, setViewerTick] = useState<number>(0);
 
   // Chunked rendering
   const [visibleCount, setVisibleCount] = useState<number>(CHUNK_SIZE);
@@ -128,6 +139,21 @@ function WatchContent() {
     loadAllChannels(false);
   }, [loadAllChannels]);
 
+  /**
+   * Keep the LIVE badges current for signed-in users.
+   *
+   * Re-fetches the channel feed every 5 minutes — the same cadence as the
+   * server-side stream verifier — so `channel.isLive` reflects the latest
+   * probe results and dead streams drop out of the list automatically.
+   */
+  const HEALTH_POLL_MS = 5 * 60 * 1000;
+  useEffect(() => {
+    const timer = setInterval(() => {
+      void loadAllChannels(false);
+    }, HEALTH_POLL_MS);
+    return () => clearInterval(timer);
+  }, [loadAllChannels]);
+
   // Back to top scroll listener
   useEffect(() => {
     const handleScroll = () => {
@@ -135,6 +161,12 @@ function WatchContent() {
     };
     window.addEventListener("scroll", handleScroll, { passive: true });
     return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  // Keep the viewer count badge breathing while the player is open
+  useEffect(() => {
+    const timer = setInterval(() => setViewerTick((t) => t + 1), 5000);
+    return () => clearInterval(timer);
   }, []);
 
   // When a channel is selected, add to watch history
@@ -162,13 +194,13 @@ function WatchContent() {
       result = result.filter((ch) => ch.category.toLowerCase() === catLower);
     }
 
-    // Country filter
+    // Country filter — normalised so "US", "us" and "United States" all match
     if (selectedCountry !== "All") {
-      const countryLower = selectedCountry.toLowerCase();
-      result = result.filter((ch) => ch.country?.toLowerCase() === countryLower);
+      result = result.filter((ch) => matchesCountry(ch.country, selectedCountry));
     }
 
-    // Multi-token search across all fields
+    // Multi-token search across all fields (cleaned title included so tag-free
+    // names match what the user actually sees on screen)
     if (searchQuery.trim()) {
       const tokens = searchQuery
         .toLowerCase()
@@ -177,7 +209,7 @@ function WatchContent() {
         .filter(Boolean);
 
       result = result.filter((ch) => {
-        const name = ch.name.toLowerCase();
+        const name = `${ch.name} ${cleanChannelTitle(ch.name)}`.toLowerCase();
         const cat = ch.category.toLowerCase();
         const country = (ch.country || "").toLowerCase();
         const lang = (ch.language || "").toLowerCase();
@@ -260,27 +292,49 @@ function WatchContent() {
     }
   };
 
+  // Display-only metadata for the Now Playing panel
+  const selectedIsFavorite = selectedChannel
+    ? currentProfile.favorites.includes(selectedChannel.id)
+    : false;
+  const viewersLabel = selectedChannel
+    ? `${formatViewers(viewerCountFor(selectedChannel.id, viewerTick))} Viewing`
+    : "";
+  const rating = selectedChannel ? ratingFor(selectedChannel.id) : 0;
+  const SelectedCategoryIcon =
+    POPULAR_CATEGORIES.find(
+      (c) => c.name.toLowerCase() === (selectedChannel?.category ?? "").toLowerCase()
+    )?.icon ?? Sparkles;
+
   return (
-    <div className="min-h-screen flex flex-col bg-[#07080c] text-slate-100">
+    <div className="min-h-screen flex flex-col bg-app text-ink">
       {/* Top Glass Navigation Bar */}
-      <header className="sticky top-0 z-40 bg-[#0a0d14]/85 backdrop-blur-xl border-b border-white/5 transition">
+      <header className="sticky top-0 z-40 bg-panel/85 backdrop-blur-xl border-b border-line transition">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
           {/* Logo & Navigation */}
           <div className="flex items-center gap-4">
             <Link
               href="/"
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-semibold border border-slate-800 transition"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-chip hover:bg-glass2 text-ink text-xs font-semibold border border-line transition"
               title="Return to Landing Page"
             >
               <Home className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Home</span>
             </Link>
 
+            <Link
+              href="/developer"
+              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-dim hover:text-cyan-300 hover:bg-cyan-500/10 text-xs font-semibold border border-transparent hover:border-cyan-500/30 transition"
+              title="Developed by Sithum Thilina"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-gradient-to-tr from-cyan-400 to-purple-500" />
+              <span>Developer</span>
+            </Link>
+
             <Link href="/" className="flex items-center gap-2.5">
               <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 via-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
                 <Tv className="w-4 h-4 text-white" />
               </div>
-              <span className="font-extrabold text-base sm:text-lg tracking-tight bg-gradient-to-r from-white via-slate-100 to-slate-400 bg-clip-text text-transparent hidden sm:inline">
+              <span className="font-extrabold text-base sm:text-lg tracking-tight bg-gradient-to-r from-ink via-ink to-dim bg-clip-text text-transparent hidden sm:inline">
                 StreamPulse TV
               </span>
             </Link>
@@ -289,18 +343,18 @@ function WatchContent() {
           {/* Search Bar */}
           <div className="flex-1 max-w-md relative hidden md:block">
             <div className="relative">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <Search className="w-4 h-4 text-dim absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 type="text"
                 placeholder={`Search ${allChannels.length.toLocaleString()} channels...`}
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-10 pr-9 py-2 rounded-xl bg-slate-900/90 text-sm text-slate-200 placeholder-slate-500 border border-slate-800 focus:border-cyan-500/80 focus:ring-2 focus:ring-cyan-500/20 outline-none transition"
+                className="w-full pl-10 pr-9 py-2 rounded-xl bg-chip text-sm text-ink placeholder-faint border border-line focus:border-cyan-500/80 focus:ring-2 focus:ring-cyan-500/20 outline-none transition"
               />
               {searchQuery && (
                 <button
                   onClick={() => setSearchQuery("")}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-dim hover:text-ink"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -310,13 +364,14 @@ function WatchContent() {
 
           {/* User Profile, Favorites, History & Refresh */}
           <div className="flex items-center gap-2">
+            <ThemeToggle />
             {/* History Pill */}
             <button
               onClick={() => setFilterMode(filterMode === "history" ? "all" : "history")}
               className={`p-2 sm:px-3 sm:py-2 rounded-xl text-xs font-semibold transition border backdrop-blur-md flex items-center gap-1.5 ${
                 filterMode === "history"
                   ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
-                  : "bg-slate-900/80 border-slate-800 text-slate-300 hover:bg-slate-800"
+                  : "bg-chip border-line text-ink hover:bg-glass2"
               }`}
               title="Watch History"
             >
@@ -330,7 +385,7 @@ function WatchContent() {
               className={`p-2 sm:px-3 sm:py-2 rounded-xl text-xs font-semibold transition border backdrop-blur-md flex items-center gap-1.5 ${
                 filterMode === "favorites"
                   ? "bg-rose-500/20 border-rose-500/40 text-rose-300"
-                  : "bg-slate-900/80 border-slate-800 text-slate-300 hover:bg-slate-800"
+                  : "bg-chip border-line text-ink hover:bg-glass2"
               }`}
               title="Favorite Channels"
             >
@@ -345,8 +400,8 @@ function WatchContent() {
 
             {/* Profile Avatar & Switcher */}
             <button
-              onClick={() => setIsAuthModalOpen(true)}
-              className="flex items-center gap-2 pl-2 pr-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 hover:border-slate-700 transition"
+              onClick={() => openAuthModal("signin")}
+              className="flex items-center gap-2 pl-2 pr-2.5 py-1.5 rounded-xl bg-chip border border-line hover:border-line2 transition"
               title="Manage Profile"
             >
               {currentProfile.avatarUrl ? (
@@ -362,8 +417,8 @@ function WatchContent() {
                   {currentProfile.name.substring(0, 1).toUpperCase()}
                 </div>
               )}
-              <span className="text-xs font-medium text-slate-200 hidden lg:inline max-w-[80px] truncate">
-                {currentProfile.isGuest ? "Guest" : currentProfile.name}
+              <span className="text-xs font-medium text-ink hidden lg:inline max-w-[80px] truncate">
+                {currentProfile.name}
               </span>
             </button>
 
@@ -371,7 +426,7 @@ function WatchContent() {
             <button
               onClick={() => loadAllChannels(true)}
               disabled={isRefreshing}
-              className="p-2 rounded-xl bg-slate-900/80 border border-slate-800 hover:bg-slate-800 text-slate-300 hover:text-white transition disabled:opacity-50"
+              className="p-2 rounded-xl bg-chip border border-line hover:bg-glass2 text-ink transition disabled:opacity-50"
               title="Re-fetch playlist"
             >
               <RotateCw className={`w-4 h-4 ${isRefreshing ? "animate-spin text-cyan-400" : ""}`} />
@@ -380,20 +435,20 @@ function WatchContent() {
         </div>
 
         {/* Mobile Search Bar */}
-        <div className="p-3 md:hidden border-t border-white/5 bg-slate-950/60">
+        <div className="p-3 md:hidden border-t border-line bg-panel/60">
           <div className="relative">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+            <Search className="w-4 h-4 text-dim absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="text"
               placeholder={`Search ${allChannels.length.toLocaleString()} channels...`}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-8 py-2 rounded-xl bg-slate-900 text-xs text-slate-200 placeholder-slate-500 border border-slate-800 outline-none"
+              className="w-full pl-9 pr-8 py-2 rounded-xl bg-chip text-xs text-ink placeholder-faint border border-line outline-none"
             />
             {searchQuery && (
               <button
                 onClick={() => setSearchQuery("")}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-dim"
               >
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -406,7 +461,7 @@ function WatchContent() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
         {/* Featured Video Player */}
         {selectedChannel && (
-          <section className="bg-gradient-to-b from-slate-900/80 to-slate-950/90 rounded-3xl p-4 sm:p-6 border border-white/10 shadow-2xl backdrop-blur-xl">
+          <section className="bg-gradient-to-b from-card/80 to-card rounded-3xl p-4 sm:p-6 border border-line2 shadow-2xl shadow-shadow backdrop-blur-xl">
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
               {/* Player Container */}
               <div className="lg:col-span-2">
@@ -418,86 +473,99 @@ function WatchContent() {
               </div>
 
               {/* Now Playing Details */}
-              <div className="flex flex-col h-full justify-between gap-4">
-                <div>
-                  <div className="flex items-center justify-between gap-2 mb-3">
-                    <span className="flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">
-                      <Radio className="w-3.5 h-3.5 animate-pulse text-cyan-400" />
-                      NOW STREAMING
+              <div className="flex flex-col h-full gap-4">
+                {/* Top status bar: active viewer count + glowing LIVE badge */}
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-gradient-to-r from-emerald-500/15 to-cyan-500/15 border border-emerald-400/40 text-emerald-600 dark:text-emerald-300 text-[11px] font-black tracking-widest shadow-[0_0_18px_rgba(16,185,129,0.28)] backdrop-blur-md">
+                    <span className="relative flex h-2 w-2">
+                      <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 animate-live-ring" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
                     </span>
+                    LIVE
+                  </span>
 
-                    <button
-                      onClick={() => toggleFavorite(selectedChannel.id)}
-                      className={`flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-medium border transition ${
-                        currentProfile.favorites.includes(selectedChannel.id)
-                          ? "bg-rose-500/20 text-rose-300 border-rose-500/30"
-                          : "bg-slate-800/80 text-slate-400 hover:text-white border-slate-700"
-                      }`}
-                    >
-                      <Heart
-                        className={`w-3.5 h-3.5 ${
-                          currentProfile.favorites.includes(selectedChannel.id)
-                            ? "fill-current text-rose-400"
-                            : ""
-                        }`}
-                      />
-                      <span>Favorite</span>
-                    </button>
-                  </div>
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-cyan-500/10 border border-cyan-400/30 text-cyan-700 dark:text-cyan-200 text-[11px] font-bold backdrop-blur-md">
+                    <Eye className="w-3.5 h-3.5" />
+                    {viewersLabel}
+                  </span>
+                </div>
 
-                  <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight leading-snug">
-                    {selectedChannel.name}
+                {/* Centered title, category pill & star rating */}
+                <div className="flex flex-col items-center text-center gap-3">
+                  <h1 className="text-xl sm:text-2xl font-bold text-ink tracking-tight leading-snug break-words">
+                    {cleanChannelTitle(selectedChannel.name)}
                   </h1>
 
-                  <div className="flex flex-wrap items-center gap-2 mt-2">
-                    <span className="px-2.5 py-1 rounded-lg bg-slate-800/90 text-xs font-medium text-slate-300 border border-slate-700/60">
-                      {selectedChannel.category}
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-glass2 border border-line2 text-xs font-semibold text-ink">
+                      <SelectedCategoryIcon className="w-3.5 h-3.5 text-cyan-300" />
+                      {selectedChannel.category || "General"}
                     </span>
+
                     {selectedChannel.country && (
-                      <span className="px-2.5 py-1 rounded-lg bg-slate-800/90 text-xs font-medium text-slate-300 border border-slate-700/60">
-                        {selectedChannel.country}
-                      </span>
-                    )}
-                    {selectedChannel.language && (
-                      <span className="px-2.5 py-1 rounded-lg bg-slate-800/90 text-xs font-medium text-slate-300 border border-slate-700/60">
-                        {selectedChannel.language}
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-chip border border-line text-xs font-medium text-dim">
+                        <span className="text-sm leading-none">
+                          {countryFlag(selectedChannel.country)}
+                        </span>
+                        {countryLabel(selectedChannel.country)}
                       </span>
                     )}
                   </div>
 
-                  <div className="mt-4 p-3 rounded-xl bg-slate-950/60 border border-white/5 text-xs text-slate-400 space-y-1">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500">Stream Protocol:</span>
-                      <span className="text-slate-300 font-mono">HLS (.m3u8)</span>
+                  {/* Modern 5-star rating */}
+                  <div className="flex items-center justify-center gap-2">
+                    <div
+                      className="flex items-center gap-0.5 text-[15px] leading-none"
+                      aria-label={`Rated ${rating.toFixed(1)} out of 5`}
+                    >
+                      {[0, 1, 2, 3, 4].map((i) => {
+                        const fill = Math.min(Math.max(rating - i, 0), 1);
+                        return (
+                          <span key={i} className="relative inline-flex text-dim/50">
+                            <span aria-hidden>★</span>
+                            <span
+                              aria-hidden
+                              className="absolute inset-0 overflow-hidden text-amber-400 drop-shadow-[0_0_6px_rgba(251,191,36,0.45)]"
+                              style={{ width: `${fill * 100}%` }}
+                            >
+                              ★
+                            </span>
+                          </span>
+                        );
+                      })}
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500">Buffer Tuning:</span>
-                      <span className="text-cyan-400 font-mono text-[11px]">60s max / Auto Bitrate</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500">CORS Support:</span>
-                      <span className="text-emerald-400 font-medium">Bypass Proxy + Direct Segments</span>
-                    </div>
-                    <div className="flex items-center justify-between truncate">
-                      <span className="text-slate-500">Stream Link:</span>
-                      <a
-                        href={selectedChannel.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-cyan-400/80 hover:text-cyan-300 flex items-center gap-1 font-mono text-[10px] max-w-[200px] truncate"
-                      >
-                        <span className="truncate">{selectedChannel.url}</span>
-                        <ExternalLink className="w-3 h-3 flex-shrink-0" />
-                      </a>
-                    </div>
+                    <span className="text-xs font-bold text-ink">{rating.toFixed(1)}</span>
                   </div>
                 </div>
 
+                {/* Primary action: full-width favorite button, gradient border + glow */}
+                <button
+                  type="button"
+                  onClick={() => toggleFavorite(selectedChannel.id)}
+                  aria-pressed={selectedIsFavorite}
+                  className={`group relative block w-full rounded-2xl p-[1.5px] transition-all duration-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400/70 ${
+                    selectedIsFavorite
+                      ? "bg-gradient-to-r from-rose-500 via-pink-500 to-fuchsia-500 shadow-[0_0_26px_rgba(244,63,94,0.4)]"
+                      : "bg-gradient-to-r from-rose-500/60 via-pink-500/50 to-fuchsia-500/60 shadow-[0_0_16px_rgba(244,63,94,0.16)] hover:shadow-[0_0_26px_rgba(244,63,94,0.35)]"
+                  }`}
+                >
+                  <span
+                    className={`flex w-full items-center justify-center gap-2 py-3 rounded-2xl text-sm font-bold transition ${
+                      selectedIsFavorite
+                        ? "bg-gradient-to-r from-rose-500 via-pink-500 to-fuchsia-500 text-white"
+                        : "bg-card text-ink group-hover:bg-glass"
+                    }`}
+                  >
+                    <Heart className={`w-4 h-4 ${selectedIsFavorite ? "fill-current" : ""}`} />
+                    {selectedIsFavorite ? "Favorited" : "Favorite"}
+                  </span>
+                </button>
+
                 {/* Channel Navigation Buttons */}
-                <div className="pt-4 border-t border-white/10 flex items-center justify-between gap-3">
+                <div className="mt-auto pt-4 border-t border-line flex items-center justify-between gap-3">
                   <button
                     onClick={handlePrevChannel}
-                    className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
+                    className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-chip hover:bg-glass2 text-ink text-xs font-semibold border border-line transition"
                   >
                     <ChevronLeft className="w-4 h-4" />
                     Previous Channel
@@ -515,66 +583,51 @@ function WatchContent() {
           </section>
         )}
 
-        {/* Categories Bar & Quick Filter Pills */}
-        <section className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            {/* Category horizontal scroll list */}
-            <div className="flex items-center gap-2 overflow-x-auto pb-2 scrollbar-none scroll-smooth">
-              {POPULAR_CATEGORIES.map((cat) => {
-                const IconComponent = cat.icon;
-                const isActive = selectedCategory === cat.name && filterMode === "all";
-                return (
-                  <button
-                    key={cat.name}
-                    onClick={() => {
-                      setSelectedCategory(cat.name);
-                      setFilterMode("all");
-                    }}
-                    className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium whitespace-nowrap transition-all duration-200 border ${
-                      isActive
-                        ? "bg-cyan-500 text-black font-semibold border-cyan-400 shadow-lg shadow-cyan-500/20 scale-105"
-                        : "bg-slate-900/80 hover:bg-slate-800 text-slate-300 border-slate-800 hover:border-slate-700"
-                    }`}
-                  >
-                    <IconComponent className={`w-3.5 h-3.5 ${isActive ? "text-black" : "text-cyan-400"}`} />
-                    <span>{cat.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Country Selector Dropdown */}
-            {countries.length > 0 && (
-              <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-auto">
-                <Globe className="w-4 h-4 text-slate-400" />
-                <select
-                  value={selectedCountry}
-                  onChange={(e) => setSelectedCountry(e.target.value)}
-                  className="px-3 py-1.5 rounded-xl bg-slate-900/90 text-xs text-slate-300 border border-slate-800 outline-none focus:border-cyan-500 transition cursor-pointer"
+        {/* Categories Bar & Country Filter Pills */}
+        <section className="space-y-3">
+          <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none scroll-smooth">
+            {POPULAR_CATEGORIES.map((cat) => {
+              const IconComponent = cat.icon;
+              const isActive = selectedCategory === cat.name && filterMode === "all";
+              return (
+                <button
+                  key={cat.name}
+                  onClick={() => {
+                    setSelectedCategory(cat.name);
+                    setFilterMode("all");
+                  }}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-medium whitespace-nowrap transition-all duration-200 border ${
+                    isActive
+                      ? "bg-cyan-500 text-black font-semibold border-cyan-400 shadow-lg shadow-cyan-500/20 scale-105"
+                      : "bg-slate-900/80 hover:bg-slate-800 text-slate-300 border-slate-800 hover:border-slate-700"
+                  }`}
                 >
-                  <option value="All">All Countries ({countries.length})</option>
-                  {countries.slice(0, 80).map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
+                  <IconComponent className={`w-3.5 h-3.5 ${isActive ? "text-black" : "text-cyan-400"}`} />
+                  <span>{cat.name}</span>
+                </button>
+              );
+            })}
           </div>
+
+          {/* Country-wise filter bar — instantly filters the grid & search results */}
+          <CountryFilter
+            countries={countries}
+            selected={selectedCountry}
+            onSelect={setSelectedCountry}
+          />
         </section>
 
         {/* Channel Grid Section */}
         <section className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+              <h2 className="text-base sm:text-lg font-bold text-ink flex items-center gap-2">
                 <span>Explore Channels</span>
                 <span className="text-xs font-medium text-cyan-400 bg-cyan-950/80 px-2 py-0.5 rounded-full border border-cyan-800/60">
                   {filteredChannels.length.toLocaleString()} matches
                 </span>
               </h2>
-              <p className="text-xs text-slate-400 mt-0.5">
+              <p className="text-xs text-dim mt-0.5">
                 Showing {Math.min(visibleCount, filteredChannels.length).toLocaleString()} of{" "}
                 {filteredChannels.length.toLocaleString()} channels (from{" "}
                 {allChannels.length.toLocaleString()} total in playlist)
@@ -661,7 +714,7 @@ function WatchContent() {
               <div ref={sentinelRef} className="h-4 w-full" />
               <button
                 onClick={() => setVisibleCount((prev) => prev + CHUNK_SIZE)}
-                className="px-6 py-2.5 rounded-2xl bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-semibold border border-slate-800 hover:border-slate-700 transition flex items-center gap-2"
+                className="px-6 py-2.5 rounded-2xl bg-chip hover:bg-glass2 text-ink text-xs font-semibold border border-line hover:border-line2 transition flex items-center gap-2"
               >
                 <span>
                   Load More ({Math.min(visibleCount, filteredChannels.length).toLocaleString()} of{" "}
@@ -685,11 +738,19 @@ function WatchContent() {
       )}
 
       {/* Footer */}
-      <footer className="border-t border-white/5 bg-slate-950/80 py-8 text-center text-xs text-slate-500 mt-auto">
+      <footer className="border-t border-line bg-panel/80 py-8 text-center text-xs text-dim mt-auto">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4">
-          <p>© 2026 StreamPulse IPTV. Streams sourced legally from iptv-org repository.</p>
-          <div className="flex items-center gap-4 text-slate-400">
-            <span>Next.js 16</span>
+          <p>© 2026 StreamPulse IPTV. Free-to-air public broadcasts, curated for you.</p>
+          <div className="flex flex-wrap justify-center items-center gap-x-4 gap-y-2 text-dim">
+            <Link
+              href="/developer"
+              className="hover:text-cyan-400 transition font-semibold text-ink"
+              title="Developed by Sithum Thilina"
+            >
+              Developed by Sithum Thilina
+            </Link>
+            <span className="hidden sm:inline">•</span>
+            <span className="hidden sm:inline">Next.js 16</span>
             <span>•</span>
             <span>HLS.js</span>
             <span>•</span>
@@ -715,7 +776,11 @@ export default function WatchPage() {
         </div>
       }
     >
-      <WatchContent />
+      {/* Mandatory authentication: no guest mode — unauthenticated visitors get
+          the cinematic sign-in wall instead of the player. */}
+      <AuthGate>
+        <WatchContent />
+      </AuthGate>
     </Suspense>
   );
 }
