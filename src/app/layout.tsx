@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { Analytics } from "@vercel/analytics/next";
 import "./globals.css";
 import { ProfileProvider } from "@/context/ProfileContext";
 import AuthModal from "@/components/AuthModal";
@@ -34,6 +35,7 @@ export default function RootLayout({
           {children}
           <AuthModal />
         </ProfileProvider>
+        <Analytics />
       </body>
     </html>
   );
