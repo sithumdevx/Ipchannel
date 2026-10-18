@@ -349,11 +349,19 @@ function WatchContent() {
               className="flex items-center gap-2 pl-2 pr-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-800 hover:border-slate-700 transition"
               title="Manage Profile"
             >
-              <div
-                className={`w-6 h-6 rounded-lg bg-gradient-to-tr ${currentProfile.avatarColor} flex items-center justify-center text-[10px] font-bold text-white shadow`}
-              >
-                {currentProfile.name.substring(0, 1).toUpperCase()}
-              </div>
+              {currentProfile.avatarUrl ? (
+                <img
+                  src={currentProfile.avatarUrl}
+                  alt={currentProfile.name}
+                  className="w-6 h-6 rounded-lg object-cover border border-cyan-400/40 shadow"
+                />
+              ) : (
+                <div
+                  className={`w-6 h-6 rounded-lg bg-gradient-to-tr ${currentProfile.avatarColor} flex items-center justify-center text-[10px] font-bold text-white shadow`}
+                >
+                  {currentProfile.name.substring(0, 1).toUpperCase()}
+                </div>
+              )}
               <span className="text-xs font-medium text-slate-200 hidden lg:inline max-w-[80px] truncate">
                 {currentProfile.isGuest ? "Guest" : currentProfile.name}
               </span>

@@ -121,11 +121,19 @@ export default function LandingPage() {
               onClick={() => setIsAuthModalOpen(true)}
               className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-semibold border border-slate-800 transition"
             >
-              <div
-                className={`w-5 h-5 rounded-lg bg-gradient-to-tr ${currentProfile.avatarColor} flex items-center justify-center text-[9px] font-bold text-white shadow`}
-              >
-                {currentProfile.name.substring(0, 1).toUpperCase()}
-              </div>
+              {currentProfile.avatarUrl ? (
+                <img
+                  src={currentProfile.avatarUrl}
+                  alt={currentProfile.name}
+                  className="w-5 h-5 rounded-lg object-cover border border-cyan-400/40 shadow"
+                />
+              ) : (
+                <div
+                  className={`w-5 h-5 rounded-lg bg-gradient-to-tr ${currentProfile.avatarColor} flex items-center justify-center text-[9px] font-bold text-white shadow`}
+                >
+                  {currentProfile.name.substring(0, 1).toUpperCase()}
+                </div>
+              )}
               <span className="hidden sm:inline">
                 {currentProfile.isGuest ? "Sign In / Profile" : currentProfile.name}
               </span>
