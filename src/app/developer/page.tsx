@@ -20,6 +20,7 @@ import {
   Award,
   MapPin,
   Rocket,
+  LayoutGrid,
 } from "lucide-react";
 
 /* Brand marks (lucide no longer ships brand icons, so we inline them) */
@@ -191,6 +192,13 @@ export default function DeveloperPage() {
           </Link>
 
           <div className="flex items-center gap-3">
+            <Link
+              href="/categories"
+              className="hidden sm:flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-semibold border border-slate-800 transition"
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+              <span>Categories</span>
+            </Link>
             <Link
               href="/"
               className="hidden sm:flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900/80 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-semibold border border-slate-800 transition"
@@ -433,6 +441,9 @@ export default function DeveloperPage() {
           <div className="flex items-center gap-6 text-slate-400">
             <Link href="/" className="hover:text-cyan-400 transition">
               Home
+            </Link>
+            <Link href="/categories" className="hover:text-cyan-400 transition">
+              Categories
             </Link>
             <Link href="/watch" className="hover:text-cyan-400 transition">
               Watch TV

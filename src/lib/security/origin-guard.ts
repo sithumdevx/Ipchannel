@@ -28,9 +28,31 @@ export interface OriginCheckResult {
 }
 
 /**
+ * The host the request was *publicly* reached on.
+ *
+ * Behind proxies (Vercel edge, load balancers) `request.nextUrl.host` can be
+ * an internal hostname, while the browser only knows the public one. Prefer
+ * the `x-forwarded-host` header (Vercel sets it to the deployment domain,
+ * e.g. `ipstreampulse.vercel.app`) and fall back to the direct host.
+ */
+function publicHost(request: NextRequest): string {
+  const forwarded = request.headers.get("x-forwarded-host");
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim().toLowerCase();
+    if (first) return first;
+  }
+  return request.nextUrl.host.toLowerCase();
+}
+
+/**
  * A request is considered first-party when:
- *  - `Origin` (if present) matches the request host, and
+ *  - `Origin` (if present) matches the public request host, and
  *  - `Sec-Fetch-Site` (if the browser sent it) is `same-origin` or `none`.
+ *
+ * Note on navigations: browsers legitimately send `Sec-Fetch-Site: cross-site`
+ * when a user *follows a link* to this app from another site, so callers must
+ * only apply this check to API requests — page routes always redirect instead
+ * of rejecting.
  *
  * Non-browser clients omit both headers — they are still rate limited and
  * must still pass the server-side URL validation on each route.
@@ -39,8 +61,8 @@ export function checkSameOrigin(request: NextRequest): OriginCheckResult {
   const origin = request.headers.get("origin");
   if (origin && origin !== "null") {
     try {
-      const originHost = new URL(origin).host;
-      if (originHost !== request.nextUrl.host) {
+      const originHost = new URL(origin).host.toLowerCase();
+      if (originHost !== publicHost(request) && originHost !== request.nextUrl.host.toLowerCase()) {
         return { ok: false, reason: "cross-origin" };
       }
     } catch {

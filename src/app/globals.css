@@ -146,6 +146,33 @@ body {
   display: none;
 }
 
+/* ---------------------------------------------------------------------------
+   Custom player: true fullscreen fill.
+
+   Applied to the player container while it is the fullscreen element (the
+   `:fullscreen` pseudo-class covers Chrome/Edge/Firefox/Android, while
+   `:-webkit-full-screen` covers Safari on iPadOS/macOS). Overrides the
+   `aspect-video` ratio so the stream fills the whole landscape display.
+--------------------------------------------------------------------------- */
+.player-fullscreen:fullscreen,
+.player-fullscreen:-webkit-full-screen {
+  aspect-ratio: auto;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   Mobile touch hardening — kill the 300ms tap delay / grey flash on controls
+   and links, and give every interactive element an adequately sized hit area.
+--------------------------------------------------------------------------- */
+button,
+a,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
 /* Slow cinematic drift for the hero aurora blobs */
 @keyframes aurora-drift {
   0%,

@@ -31,6 +31,26 @@ interface VideoPlayerProps {
   onPrevChannel?: () => void;
 }
 
+/**
+ * WebKit-prefixed fullscreen typings.
+ *
+ * iOS/iPadOS Safari never exposed the standard Fullscreen API on iPhone (and
+ * only partially on older iPads) — instead the <video> element owns a native
+ * fullscreen controller entered through `webkitEnterFullscreen()`. Supporting
+ * both paths is what makes the fullscreen button actually work on mobile.
+ */
+type WebkitDocument = Document & {
+  webkitFullscreenElement?: Element | null;
+  webkitExitFullscreen?: () => Promise<void> | void;
+};
+type WebkitVideo = HTMLVideoElement & {
+  webkitEnterFullscreen?: () => void;
+  webkitSupportsFullscreen?: boolean;
+};
+type WebkitContainer = HTMLElement & {
+  webkitRequestFullscreen?: () => Promise<void> | void;
+};
+
 export default function VideoPlayer({
   channel,
   onClose,
@@ -251,17 +271,96 @@ export default function VideoPlayer({
     }
   };
 
-  // Fullscreen toggle
-  const toggleFullscreen = () => {
-    const container = containerRef.current;
-    if (!container) return;
+  // Fullscreen toggle — covers the standard API (Chrome/Edge/Firefox/Android,
+  // iPadOS 16.4+), the WebKit-prefixed API (older Safari/iPadOS), and iOS
+  // Safari's video-only native fullscreen as the final fallback.
+  const toggleFullscreen = useCallback(() => {
+    const video = videoRef.current as WebkitVideo | null;
+    const container = containerRef.current as WebkitContainer | null;
+    const doc = document as WebkitDocument;
 
-    if (!document.fullscreenElement) {
-      container.requestFullscreen().then(() => setIsFullscreen(true)).catch(console.error);
-    } else {
-      document.exitFullscreen().then(() => setIsFullscreen(false)).catch(console.error);
+    const activeElement = doc.fullscreenElement ?? doc.webkitFullscreenElement;
+
+    // --- Exit -------------------------------------------------------------
+    if (activeElement) {
+      if (doc.fullscreenElement && doc.exitFullscreen) {
+        doc.exitFullscreen().catch(console.error);
+      } else if (doc.webkitExitFullscreen) {
+        void doc.webkitExitFullscreen();
+      }
+      return;
     }
-  };
+
+    // --- Enter: standard / prefixed element fullscreen --------------------
+    const requestFs =
+      (container?.requestFullscreen?.bind(container) as (() => Promise<void>) | undefined) ??
+      (container?.webkitRequestFullscreen?.bind(container) as
+        | (() => Promise<void> | void)
+        | undefined);
+
+    if (requestFs) {
+      try {
+        const result = requestFs() as Promise<void> | void;
+        if (result && typeof (result as Promise<void>).then === "function") {
+          (result as Promise<void>)
+            .then(() => setIsFullscreen(true))
+            .catch(() => {
+              // Element fullscreen rejected (common on iPhone Safari) — fall
+              // back to the native video controller, which rotates to landscape.
+              if (video && typeof video.webkitEnterFullscreen === "function") {
+                video.webkitEnterFullscreen();
+              }
+            });
+        } else {
+          setIsFullscreen(true);
+        }
+      } catch {
+        if (video && typeof video.webkitEnterFullscreen === "function") {
+          video.webkitEnterFullscreen();
+        }
+      }
+      return;
+    }
+
+    // --- Enter: iOS Safari native video fullscreen ------------------------
+    if (video && typeof video.webkitEnterFullscreen === "function") {
+      video.webkitEnterFullscreen();
+      return;
+    }
+
+    console.warn("Fullscreen is not supported in this browser.");
+  }, []);
+
+  /**
+   * Keep `isFullscreen` in sync with reality.
+   *
+   * Standard `fullscreenchange` covers desktop/Android; the WebKit events
+   * (`webkitfullscreenchange`, plus the non-standard `webkitbegin/endfullscreen`
+   * dispatched on the <video> element during iOS native fullscreen) cover
+   * Safari — including when the user exits via the native close button or the
+   * home indicator rather than our own control.
+   */
+  useEffect(() => {
+    const syncFromDocument = () => {
+      const doc = document as WebkitDocument;
+      setIsFullscreen(Boolean(doc.fullscreenElement ?? doc.webkitFullscreenElement));
+    };
+    const handleVideoEnter = () => setIsFullscreen(true);
+    const handleVideoExit = () => setIsFullscreen(false);
+
+    document.addEventListener("fullscreenchange", syncFromDocument);
+    document.addEventListener("webkitfullscreenchange", syncFromDocument);
+    // iOS-only native fullscreen transitions (not part of the DOM typings).
+    videoRef.current?.addEventListener("webkitbeginfullscreen", handleVideoEnter);
+    videoRef.current?.addEventListener("webkitendfullscreen", handleVideoExit);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", syncFromDocument);
+      document.removeEventListener("webkitfullscreenchange", syncFromDocument);
+      videoRef.current?.removeEventListener("webkitbeginfullscreen", handleVideoEnter);
+      videoRef.current?.removeEventListener("webkitendfullscreen", handleVideoExit);
+    };
+  }, []);
 
   // Picture in picture
   const togglePiP = async () => {
@@ -329,16 +428,27 @@ export default function VideoPlayer({
       ref={containerRef}
       onMouseMove={handleMouseMove}
       onMouseLeave={() => isPlaying && setShowControls(false)}
-      className="relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl ring-1 ring-white/10 group select-none"
+      className="player-fullscreen relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-2xl ring-1 ring-white/10 group select-none"
     >
       {/* Video Element */}
       <video
         ref={videoRef}
         className="w-full h-full object-contain cursor-pointer"
         onClick={togglePlay}
+        onDoubleClick={toggleFullscreen}
+        onTouchStart={() => {
+          // Tapping the video on mobile re-reveals the controls (and restarts
+          // their auto-hide timer) instead of relying on a mouse cursor.
+          setShowControls(true);
+          handleMouseMove();
+        }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         playsInline
+        // iOS Safari: keep playback inside the page until the user opts into
+        // fullscreen — prevents the video being pushed behind the URL bar.
+        webkit-playsinline=""
+        x5-playsinline=""
       />
 
       {/* Loading Indicator */}
@@ -434,12 +544,12 @@ export default function VideoPlayer({
             </div>
           )}
 
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h2 className="text-white font-semibold text-base leading-tight drop-shadow">
+              <h2 className="text-white font-semibold text-sm sm:text-base leading-tight drop-shadow truncate max-w-[42vw] sm:max-w-none">
                 {cleanChannelTitle(channel.name)}
               </h2>
-              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
+              <span className="flex-shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30">
                 <span className="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
                 LIVE
               </span>
@@ -468,7 +578,7 @@ export default function VideoPlayer({
         </div>
 
         {/* Right Header Badges: Proxy Switcher & Close */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-shrink-0">
           <button
             onClick={() => {
               const nextProxy = !useProxy;
@@ -476,7 +586,7 @@ export default function VideoPlayer({
               loadStream(channel.url, nextProxy);
             }}
             title={useProxy ? "Proxied via Next.js backend (Direct Segments)" : "Direct stream"}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium backdrop-blur-md border transition ${
+            className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium backdrop-blur-md border transition ${
               useProxy
                 ? "bg-emerald-500/20 border-emerald-500/30 text-emerald-300"
                 : "bg-slate-800/80 border-slate-700/80 text-slate-300 hover:bg-slate-700/80"
@@ -502,28 +612,43 @@ export default function VideoPlayer({
         </div>
       </div>
 
+      {/* Prominent mobile-only fullscreen button — large touch target that
+          triggers the native fullscreen API (landscape video on iOS/Android) */}
+      {showControls && !isFullscreen && !isLoading && !errorMessage && (
+        <button
+          type="button"
+          onClick={toggleFullscreen}
+          className="sm:hidden absolute bottom-[4.5rem] right-3 z-20 flex items-center gap-2 pl-3.5 pr-4 py-3 rounded-2xl bg-gradient-to-r from-cyan-400 to-blue-600 text-black text-xs font-extrabold shadow-2xl shadow-cyan-500/40 active:scale-95 transition"
+          title="Enter fullscreen"
+        >
+          <Maximize className="w-4.5 h-4.5" />
+          <span>Fullscreen</span>
+        </button>
+      )}
+
       {/* Bottom Controls Bar */}
       <div
-        className={`absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent z-10 transition-opacity duration-300 ${
+        className={`absolute bottom-0 left-0 right-0 p-3 sm:p-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] bg-gradient-to-t from-black/90 via-black/60 to-transparent z-10 transition-opacity duration-300 ${
           showControls ? "opacity-100" : "opacity-0 pointer-events-none"
         }`}
       >
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           {/* Left Controls: Play, Volume, Live Badge */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
             <button
               onClick={togglePlay}
-              className="p-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white backdrop-blur-md transition transform active:scale-95"
+              className="p-3 sm:p-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white backdrop-blur-md transition transform active:scale-95"
               title={isPlaying ? "Pause (Space)" : "Play (Space)"}
             >
               {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 fill-current" />}
             </button>
 
-            {/* Volume */}
+            {/* Volume — the slider is hidden on phones (hardware volume keys
+                + iOS ignores programmatic volume); mute stays reachable. */}
             <div className="flex items-center gap-2 group/volume">
               <button
                 onClick={toggleMute}
-                className="p-2 rounded-xl text-slate-300 hover:text-white transition"
+                className="p-2.5 sm:p-2 rounded-xl text-slate-300 hover:text-white transition"
                 title="Mute (M)"
               >
                 {isMuted || volume === 0 ? (
@@ -541,7 +666,7 @@ export default function VideoPlayer({
                 step="0.05"
                 value={isMuted ? 0 : volume}
                 onChange={handleVolumeChange}
-                className="w-16 md:w-24 h-1.5 bg-white/20 accent-cyan-400 rounded-lg cursor-pointer"
+                className="hidden sm:block w-16 md:w-24 h-1.5 bg-white/20 accent-cyan-400 rounded-lg cursor-pointer"
               />
             </div>
 
@@ -553,11 +678,11 @@ export default function VideoPlayer({
           </div>
 
           {/* Right Controls: Reload, Quality/Auto-bitrate, PiP, Fullscreen */}
-          <div className="flex items-center gap-2 relative">
+          <div className="flex items-center gap-1.5 sm:gap-2 relative flex-shrink-0">
             {/* Reconnect / Reload */}
             <button
               onClick={() => loadStream(channel.url, useProxy)}
-              className="p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition"
+              className="p-2.5 sm:p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition"
               title="Reload Stream"
             >
               <RotateCw className="w-4 h-4" />
@@ -613,22 +738,22 @@ export default function VideoPlayer({
               </div>
             )}
 
-            {/* Picture in Picture */}
+            {/* Picture in Picture — desktop/tablet only (no stable iPhone API) */}
             <button
               onClick={togglePiP}
-              className="p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition"
+              className="hidden sm:flex p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition"
               title="Picture-in-Picture"
             >
               <PictureInPicture className="w-4 h-4" />
             </button>
 
-            {/* Fullscreen */}
+            {/* Fullscreen — larger touch target on mobile */}
             <button
               onClick={toggleFullscreen}
-              className="p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition"
+              className="flex items-center justify-center p-3 sm:p-2 rounded-xl text-slate-300 hover:text-white hover:bg-white/10 transition active:scale-95"
               title={isFullscreen ? "Exit Fullscreen (F)" : "Fullscreen (F)"}
             >
-              {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
+              {isFullscreen ? <Minimize className="w-6 h-6 sm:w-5 sm:h-5" /> : <Maximize className="w-6 h-6 sm:w-5 sm:h-5" />}
             </button>
           </div>
         </div>

@@ -3,14 +3,19 @@ import { checkRateLimit } from "@/lib/security/rate-limit";
 import { checkSameOrigin, getClientIp } from "@/lib/security/origin-guard";
 
 /**
- * Security gate for every API request.
+ * Security gate, running before the route handlers.
  *
- * Runs before the route handlers and enforces, in order:
- *   1. Same-origin policy (blocks other sites driving the API from a browser,
- *      and dumb cross-site scrapers) — `Sec-Fetch-Site` + `Origin` checks.
- *   2. Per-IP, per-endpoint rate limits (429 + `Retry-After` on abuse).
- *   3. `X-Robots-Tag: noindex, nofollow` on all API responses so search
- *      engines never index the endpoints.
+ * Enforces, in order:
+ *   0. Edge auth for `/watch` — visitors without a Supabase session cookie get
+ *      a clean 307 redirect to `/?login=true` (which auto-opens the auth
+ *      modal), never a raw JSON error body.
+ *   1. Same-origin policy on `/api/*` (blocks other sites driving the API from
+ *      a browser context, and dumb cross-site scrapers) — `Sec-Fetch-Site` +
+ *      `Origin` checks. Never applied to page routes: cross-site navigations
+ *      are legitimate browser traffic and always get a redirect instead.
+ *   2. Per-IP, per-endpoint rate limits on `/api/*` (429 + `Retry-After`).
+ *   3. `X-Robots-Tag: noindex, nofollow` on all responses so search engines
+ *      never index the endpoints.
  *
  * Note: Next.js 16 renamed the `middleware.ts` file convention to `proxy.ts`.
  */
@@ -86,12 +91,16 @@ function isProtectedPath(pathname: string): boolean {
  * into `.0`, `.1`, … when it exceeds the cookie size limit. The presence of a
  * non-empty value is the signal; decoding JWT expiry here would duplicate
  * client logic and isn't required — the browser client re-validates on load.
+ *
+ * The project ref is matched loosely (`[a-z0-9-]+`, case-insensitive) so a
+ * ref containing hyphens or an uppercase letter never causes a false
+ * "logged out" bounce.
  */
 function findSessionCookie(request: NextRequest): boolean {
   const cookies = request.cookies.getAll();
   return cookies.some(
     (cookie) =>
-      /^sb-[a-z0-9]+-auth-token(\.\d+)?$/.test(cookie.name) &&
+      /^sb-[a-z0-9-]+-auth-token(\.\d+)?$/i.test(cookie.name) &&
       cookie.value.trim().length > 0
   );
 }
@@ -101,44 +110,62 @@ export function proxy(request: NextRequest) {
 
   // 0) Mandatory auth: /watch is login-gated at the edge. Without a Supabase
   //    session cookie the visitor is bounced to the landing page with
-  //    ?signin=1, which auto-opens the auth modal. (Client-side AuthGate is
-  //    the second line of defence, not the only one.)
+  //    ?login=true, which auto-opens the auth modal. This branch always
+  //    answers with a *browser-friendly redirect* — never a raw JSON error —
+  //    so visitors arriving from external links (Sec-Fetch-Site: cross-site)
+  //    or via the Vercel preview/custom domains still get the sign-in flow.
+  //    (Client-side AuthGate is the second line of defence, not the only one.)
   if (isProtectedPath(pathname)) {
     const session = findSessionCookie(request);
     if (!session) {
       const redirect = request.nextUrl.clone();
       redirect.pathname = "/";
-      redirect.search = "?signin=1";
+      redirect.search = "?login=true";
       return NextResponse.redirect(redirect, { status: 307 });
     }
   }
 
-  // 1) Cross-site requests may never touch the API from a browser context.
-  const origin = checkSameOrigin(request);
-  if (!origin.ok) {
-    return deny(403, "Forbidden");
+  // 1) API hardening — origin & rate-limit checks only apply to /api/*.
+  //    Page routes (like /watch) are excluded on purpose: browsers following
+  //    cross-site links legitimately send `Sec-Fetch-Site: cross-site` on
+  //    navigations, and answering those with `{"error":"Forbidden"}` JSON was
+  //    the auth-redirect bug reported on https://ipstreampulse.vercel.app.
+  if (pathname.startsWith("/api/")) {
+    // 1a) Cross-site requests may never touch the API from a browser context.
+    const origin = checkSameOrigin(request);
+    if (!origin.ok) {
+      return deny(403, "Forbidden");
+    }
+
+    // 1b) Rate limit per client IP and endpoint.
+    const policy = policyFor(pathname);
+    const ip = getClientIp(request);
+    const bucket = `${pathname}:${ip}`;
+    const result = checkRateLimit(bucket, policy.limit, policy.windowMs);
+
+    if (!result.allowed) {
+      return deny(429, "Too many requests", {
+        "Retry-After": String(result.resetInSeconds),
+        "X-RateLimit-Limit": String(result.limit),
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Reset": String(result.resetInSeconds),
+      });
+    }
+
+    // 2) API pass-through — surface the rate-limit budget so well-behaved
+    //    clients can back off before hitting the ceiling.
+    const apiResponse = NextResponse.next();
+    apiResponse.headers.set("X-RateLimit-Limit", String(result.limit));
+    apiResponse.headers.set("X-RateLimit-Remaining", String(result.remaining));
+    apiResponse.headers.set("X-RateLimit-Reset", String(result.resetInSeconds));
+    apiResponse.headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
+    apiResponse.headers.set("Referrer-Policy", "no-referrer");
+    apiResponse.headers.set("X-Content-Type-Options", "nosniff");
+    return apiResponse;
   }
 
-  // 2) Rate limit per client IP and endpoint.
-  const policy = policyFor(pathname);
-  const ip = getClientIp(request);
-  const bucket = `${pathname}:${ip}`;
-  const result = checkRateLimit(bucket, policy.limit, policy.windowMs);
-
-  if (!result.allowed) {
-    return deny(429, "Too many requests", {
-      "Retry-After": String(result.resetInSeconds),
-      "X-RateLimit-Limit": String(result.limit),
-      "X-RateLimit-Remaining": "0",
-      "X-RateLimit-Reset": String(result.resetInSeconds),
-    });
-  }
-
-  // 3) Pass through with visibility headers for the client.
+  // 2) Page pass-through with baseline visibility headers for the client.
   const response = NextResponse.next();
-  response.headers.set("X-RateLimit-Limit", String(result.limit));
-  response.headers.set("X-RateLimit-Remaining", String(result.remaining));
-  response.headers.set("X-RateLimit-Reset", String(result.resetInSeconds));
   response.headers.set("X-Robots-Tag", "noindex, nofollow, noarchive");
   response.headers.set("Referrer-Policy", "no-referrer");
   response.headers.set("X-Content-Type-Options", "nosniff");

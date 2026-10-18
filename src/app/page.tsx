@@ -459,16 +459,20 @@ export default function LandingPage() {
   const activeChipSpec = CHIPS[activeChip] ?? CHIPS[0];
 
   /**
-   * The edge proxy bounces unauthenticated `/watch` visitors to `/?signin=1`.
-   * Honour that here by opening the auth modal immediately, so the redirect
-   * lands the user on the login screen rather than a passive landing page.
+   * The edge proxy bounces unauthenticated `/watch` visitors to `/?login=true`
+   * (legacy links used `/?signin=1`). Honour both here by opening the auth
+   * modal immediately, so the redirect lands the user on the login screen
+   * rather than a passive landing page.
    */
   useEffect(() => {
     if (typeof window === "undefined") return;
     const params = new URLSearchParams(window.location.search);
-    if (params.get("signin") !== "1") return;
+    const requestedAuth =
+      params.get("login") === "true" || params.get("signin") === "1";
+    if (!requestedAuth) return;
     openAuthModal("signin");
     // Remove the param from the URL so a refresh doesn't re-trigger the modal.
+    params.delete("login");
     params.delete("signin");
     const next = params.toString()
       ? `${window.location.pathname}?${params.toString()}`
@@ -588,12 +592,12 @@ export default function LandingPage() {
             <a href="#browse" className="px-3.5 py-2 rounded-xl text-ink bg-glass2 transition">
               Browse
             </a>
-            <a
-              href="#featured-rails"
+            <Link
+              href="/categories"
               className="px-3.5 py-2 rounded-xl text-dim hover:text-ink hover:bg-glass transition"
             >
               Categories
-            </a>
+            </Link>
             <Link
               href="/developer"
               className="px-3.5 py-2 rounded-xl text-dim hover:text-ink hover:bg-glass transition"
@@ -1144,6 +1148,9 @@ export default function LandingPage() {
           <div className="flex items-center gap-6 text-slate-400">
             <Link href={watchHref()} className="hover:text-cyan-400 transition">
               Watch TV
+            </Link>
+            <Link href="/categories" className="hover:text-cyan-400 transition">
+              Categories
             </Link>
             <Link href="/developer" className="hover:text-cyan-400 transition">
               Developer

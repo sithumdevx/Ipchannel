@@ -35,10 +35,34 @@ function sanitizeNext(next: string | null): string {
   return decoded;
 }
 
+/**
+ * Resolve the public origin the request was reached on.
+ *
+ * Deployment hosts (Vercel edge, previews, custom domains) can present an
+ * internal URL to the runtime, so trust the forwarded headers first:
+ * `x-forwarded-proto` + `x-forwarded-host`/`host`, then fall back to the
+ * request URL's own origin for local development.
+ */
+function resolveOrigin(request: NextRequest): string {
+  const forwardedHost =
+    request.headers.get("x-forwarded-host")?.split(",")[0]?.trim() ||
+    request.headers.get("host")?.split(",")[0]?.trim();
+  const forwardedProto =
+    request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() ||
+    request.nextUrl.protocol.replace(":", "");
+  if (forwardedProto && forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+  return request.nextUrl.origin;
+}
+
 export async function GET(request: NextRequest) {
-  const { searchParams, origin } = new URL(request.url);
+  const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
   const next = sanitizeNext(searchParams.get("next"));
+  // Always redirect back to whichever domain the visitor is actually using
+  // (https://ipstreampulse.vercel.app, a preview URL, or a custom domain).
+  const origin = resolveOrigin(request);
 
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -52,7 +76,9 @@ export async function GET(request: NextRequest) {
 
   if (code && supabaseUrl && supabaseAnonKey) {
     const cookieStore = await cookies();
-    const secure = request.nextUrl.protocol === "https:";
+    // Secure cookies on the public HTTPS origin, even when the runtime itself
+    // only sees an internal http:// hop behind the deployment proxy.
+    const secure = origin.startsWith("https:");
     const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
       cookies: {
         getAll() {
@@ -76,6 +102,8 @@ export async function GET(request: NextRequest) {
 
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (!error) {
+      // Session cookies are now set on this response — hand the user straight
+      // back to the player (`/watch` by default) on the same origin.
       return NextResponse.redirect(`${origin}${next}`, { headers: noStore });
     }
     // Log the reason only — never echo provider internals to the client.

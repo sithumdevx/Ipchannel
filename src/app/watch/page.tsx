@@ -24,6 +24,8 @@ import {
   ArrowUp,
   History,
   Home,
+  LayoutGrid,
+  Tag,
 } from "lucide-react";
 import VideoPlayer from "@/components/VideoPlayer";
 import ChannelCard from "@/components/ChannelCard";
@@ -322,6 +324,15 @@ function WatchContent() {
             </Link>
 
             <Link
+              href="/categories"
+              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-dim hover:text-cyan-300 hover:bg-cyan-500/10 text-xs font-semibold border border-transparent hover:border-cyan-500/30 transition"
+              title="Browse all categories"
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+              <span>Categories</span>
+            </Link>
+
+            <Link
               href="/developer"
               className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-dim hover:text-cyan-300 hover:bg-cyan-500/10 text-xs font-semibold border border-transparent hover:border-cyan-500/30 transition"
               title="Developed by Sithum Thilina"
@@ -426,7 +437,7 @@ function WatchContent() {
             <button
               onClick={() => loadAllChannels(true)}
               disabled={isRefreshing}
-              className="p-2 rounded-xl bg-chip border border-line hover:bg-glass2 text-ink transition disabled:opacity-50"
+              className="hidden sm:flex p-2 rounded-xl bg-chip border border-line hover:bg-glass2 text-ink transition disabled:opacity-50"
               title="Re-fetch playlist"
             >
               <RotateCw className={`w-4 h-4 ${isRefreshing ? "animate-spin text-cyan-400" : ""}`} />
@@ -607,6 +618,23 @@ function WatchContent() {
                 </button>
               );
             })}
+
+            {/* Deep-linked category (e.g. /watch?category=Business) that isn't in
+                the popular strip gets its own highlighted pill so the active
+                filter is always visible and clearable. */}
+            {selectedCategory &&
+              filterMode === "all" &&
+              !POPULAR_CATEGORIES.some((c) => c.name === selectedCategory) && (
+                <button
+                  onClick={() => setSelectedCategory("All")}
+                  className="flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-semibold whitespace-nowrap bg-cyan-500 text-black border border-cyan-400 shadow-lg shadow-cyan-500/20 scale-105 transition-all duration-200"
+                  title="Clear category filter"
+                >
+                  <Tag className="w-3.5 h-3.5" />
+                  <span>{selectedCategory}</span>
+                  <X className="w-3 h-3" />
+                </button>
+              )}
           </div>
 
           {/* Country-wise filter bar — instantly filters the grid & search results */}
@@ -742,6 +770,10 @@ function WatchContent() {
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4">
           <p>© 2026 StreamPulse IPTV. Free-to-air public broadcasts, curated for you.</p>
           <div className="flex flex-wrap justify-center items-center gap-x-4 gap-y-2 text-dim">
+            <Link href="/categories" className="hover:text-cyan-400 transition font-semibold text-ink">
+              Categories
+            </Link>
+            <span>•</span>
             <Link
               href="/developer"
               className="hover:text-cyan-400 transition font-semibold text-ink"
