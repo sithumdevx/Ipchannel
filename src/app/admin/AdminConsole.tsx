@@ -267,7 +267,7 @@ function ActionButton({
 /* Console                                                                     */
 /* -------------------------------------------------------------------------- */
 
-export default function AdminConsole({ adminName }: { adminName: string }) {
+export default function AdminConsole({ adminName, adminId }: { adminName: string; adminId: string }) {
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -616,7 +616,7 @@ export default function AdminConsole({ adminName }: { adminName: string }) {
 
         {tab === "streams" && <StreamsPanel onStats={setStats} />}
 
-        {tab === "users" && <UsersPanel />}
+        {tab === "users" && <UsersPanel adminId={adminId} />}
 
         {tab === "broadcast" && (
           <BroadcastPanel

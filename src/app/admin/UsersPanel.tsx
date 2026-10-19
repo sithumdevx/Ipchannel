@@ -17,19 +17,20 @@ import type { AdminUserRow, AdminUsersPage } from "@/types/admin";
 import { Panel } from "@/components/admin/charts";
 
 /**
- * User management and moderation.
+ * User management: roles and moderation.
  *
- * Two things this table deliberately does *not* do:
+ * The directory is Supabase's `auth.users` (who has an account); the `role`
+ * column comes from `public.profiles` and is the only thing that grants console
+ * access. Two rules shape the table:
  *
- *  - **It does not show a role column that could be edited.** There is no role
- *    stored anywhere in StreamPulse; `admin` here is derived on the server from
- *    the same `ADMIN_EMAILS` allowlist that guards every route, and it is
- *    rendered read-only. Exposing it as a toggle would invent a second
- *    authorization model that nothing else consults.
- *  - **It does not let an operator act on their own account.** The server
- *    refuses that outright — a mis-click that suspends the only admin cannot be
- *    undone from this UI — and the button is disabled here too, so the refusal
- *    is visible before the request rather than only as an error after it.
+ *  - **A role can be changed here and nowhere else.** The toggle writes
+ *    `public.profiles.role` through the service role; members hold no write
+ *    privilege on that table, so `admin` cannot be granted from a client.
+ *  - **No operator can act on their own account.** The server refuses it
+ *    outright and the buttons are disabled here, so the refusal is visible
+ *    before the request rather than only as an error after it. It also means the
+ *    last administrator on a deployment cannot demote or suspend themselves out
+ *    of the console.
  *
  * When the service-role key is absent the table says so and explains what to
  * set, instead of rendering zero users, which would read as "nobody has
@@ -38,7 +39,7 @@ import { Panel } from "@/components/admin/charts";
 
 const PER_PAGE = 25;
 
-type ModerationAction = "suspend" | "restore" | "revoke-sessions";
+type ModerationAction = "suspend" | "restore" | "revoke-sessions" | "promote" | "demote";
 
 interface Notice {
   tone: "ok" | "error";
@@ -65,7 +66,7 @@ function formatAge(epochMs: number): string {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-export default function UsersPanel() {
+export default function UsersPanel({ adminId }: { adminId: string }) {
   const [data, setData] = useState<AdminUsersPage | null>(null);
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -309,6 +310,7 @@ export default function UsersPanel() {
                 <UserRow
                   key={user.id}
                   user={user}
+                  adminId={adminId}
                   busy={pending === user.id}
                   armed={isArmed}
                   onAction={(action) => void moderate(user.id, action)}
@@ -349,11 +351,13 @@ export default function UsersPanel() {
         <p className="flex items-start gap-2 text-[11px] text-slate-500 leading-relaxed">
           <ShieldCheck className="w-3.5 h-3.5 flex-shrink-0 mt-px text-emerald-400/70" />
           <span>
-            Suspend bans the account in Supabase and signs it out everywhere; Restore lifts the ban;
-            Revoke signs every session out without banning, which is the right tool for a leaked
-            token. Roles are not stored — <span className="text-slate-400">admin</span> is derived
-            from the same server-side allowlist that guards this page, so it cannot be granted from
-            here or forged from a client.
+            Promote and Demote set this account&apos;s{" "}
+            <span className="text-slate-400">role</span> in{" "}
+            <span className="text-slate-400">public.profiles</span> — that column is the whole
+            authorization model, so it is written through the service role and cannot be set from a
+            client. It takes effect on the account&apos;s next page load. Suspend bans the account in
+            Supabase and signs it out everywhere; Restore lifts the ban; Revoke signs every session
+            out without banning, which is the right tool for a leaked token.
           </span>
         </p>
       </div>
@@ -365,22 +369,33 @@ export default function UsersPanel() {
 
 function UserRow({
   user,
+  adminId,
   busy,
   armed,
   onAction,
 }: {
   user: AdminUserRow;
+  /** The signed-in operator's id — their own row is never actionable. */
+  adminId: string;
   busy: boolean;
   armed: (userId: string, action: ModerationAction) => boolean;
   onAction: (action: ModerationAction) => void;
 }) {
-  const isSelfArmed = (action: ModerationAction) => armed(user.id, action);
-  const disabled = busy;
+  const isSelf = user.id === adminId;
 
-  const buttonClass = (active: boolean, tone: "amber" | "rose" | "slate") => {
+  /** Suffix that explains a disabled button in its tooltip. */
+  const selfNote = isSelf ? " You cannot act on your own account." : "";
+
+  const isSelfArmed = (action: ModerationAction) => armed(user.id, action);
+  // Mirrors the server's refusal, so the reason is visible before the click
+  // rather than only as an error afterwards.
+  const disabled = busy || isSelf;
+
+  const buttonClass = (active: boolean, tone: "amber" | "rose" | "cyan" | "slate") => {
     const palette = {
       amber: { border: "#fbbf24", bg: "#fbbf241a", fg: "#fcd34d" },
       rose: { border: "#fb7185", bg: "#fb71851a", fg: "#fda4af" },
+      cyan: { border: "#22d3ee", bg: "#22d3ee1a", fg: "#67e8f9" },
       slate: { border: "#64748b", bg: "#64748b1a", fg: "#cbd5e1" },
     }[tone];
 
@@ -410,8 +425,8 @@ function UserRow({
           }`}
           title={
             user.role === "admin"
-              ? "On the ADMIN_EMAILS allowlist — derived server-side, not stored as a role."
-              : "Ordinary member account."
+              ? "Role `admin` in public.profiles — this account can open the console."
+              : "Role `user` — an ordinary member account."
           }
         >
           {user.role === "admin" && <ShieldCheck className="w-3 h-3" />}
@@ -450,6 +465,44 @@ function UserRow({
 
       <td className="py-2.5">
         <div className="flex items-center justify-end gap-1.5">
+          {/* Role toggle. The button always names the role the account does
+              *not* have, so the label already describes the outcome; promoting
+              is the only action here that widens access, so it is styled to
+              stand apart from the moderation pair. */}
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onAction(user.role === "admin" ? "demote" : "promote")}
+            title={
+              (user.role === "admin"
+                ? "Remove console access: set this account's role back to user."
+                : "Grant console access: set this account's role to admin.") + selfNote
+            }
+            className="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider transition disabled:opacity-40 disabled:cursor-not-allowed"
+            style={
+              isSelfArmed(user.role === "admin" ? "demote" : "promote")
+                ? user.role === "admin"
+                  ? { borderColor: "#fbbf24", background: "#fbbf241a", color: "#fcd34d" }
+                  : { borderColor: "#22d3ee", background: "#22d3ee1a", color: "#67e8f9" }
+                : buttonClass(false, user.role === "admin" ? "slate" : "cyan")
+            }
+          >
+            {busy ? (
+              <RefreshCw className="w-3 h-3 animate-spin" />
+            ) : isSelfArmed(user.role === "admin" ? "demote" : "promote") ? (
+              user.role === "admin" ? (
+                <>Confirm demote</>
+              ) : (
+                <>Confirm promote</>
+              )
+            ) : (
+              <>
+                {user.role === "admin" ? <ShieldCheck className="w-3 h-3" /> : <UserCog className="w-3 h-3" />}
+                {user.role === "admin" ? "Demote" : "Promote"}
+              </>
+            )}
+          </button>
+
           {/* Suspend / restore share one toggle button so the affordance never
               implies two independent operations on the same row. */}
           <button
@@ -457,9 +510,9 @@ function UserRow({
             disabled={disabled}
             onClick={() => onAction(user.suspended ? "restore" : "suspend")}
             title={
-              user.suspended
+              (user.suspended
                 ? "Lift the ban and let this account sign in again."
-                : "Ban this account and sign it out everywhere."
+                : "Ban this account and sign it out everywhere.") + selfNote
             }
             className="rounded-lg border px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider transition disabled:opacity-40 disabled:cursor-not-allowed"
             style={
@@ -489,7 +542,9 @@ function UserRow({
             type="button"
             disabled={disabled}
             onClick={() => onAction("revoke-sessions")}
-            title="Sign every session out without banning — for a leaked or shared token."
+            title={
+              "Sign every session out without banning — for a leaked or shared token." + selfNote
+            }
             className="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-wider transition disabled:opacity-40 disabled:cursor-not-allowed"
             style={
               isSelfArmed("revoke-sessions")

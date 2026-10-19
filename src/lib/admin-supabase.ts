@@ -1,16 +1,16 @@
 import { createClient, type SupabaseClient, type User } from "@supabase/supabase-js";
-import { isAdminEmail } from "@/lib/admin";
+import { normalizeRole, PROFILES_TABLE, type UserRole } from "@/lib/user-role";
 import type { AdminUserRow, AdminUsers, AdminUsersPage } from "@/types/admin";
 
 /**
- * Supabase-backed admin analytics and moderation.
+ * Supabase-backed admin analytics, moderation, and role management.
  *
- * Everything here needs the **service role key**. The user directory and the
- * cross-member favorites aggregate both sit behind row-level security, so they
- * are genuinely unreadable with the anon key — there is no clever way around
- * that, and pretending otherwise would mean showing a misleading zero. When the
- * key is absent every function degrades to an explicit "not available" with a
- * reason the console displays, instead of failing.
+ * Everything here needs the **service role key**. The user directory, the
+ * cross-member favorites aggregate, and every account's `role` all sit behind
+ * row-level security, so they are genuinely unreadable with the anon key — there
+ * is no clever way around that, and pretending otherwise would mean showing a
+ * misleading zero. When the key is absent every function degrades to an explicit
+ * "not available" with a reason the console displays, instead of failing.
  *
  * The service role bypasses RLS entirely, so this module is imported *only* from
  * admin-authorized route handlers. It must never be reachable from a component
@@ -21,6 +21,9 @@ const USERS_PER_PAGE = 1_000;
 
 /** How many directory pages `/api/admin/stats` samples for the sign-up histogram. */
 const MAX_USER_PAGES = 5;
+
+/** Cap on the rows read from `profiles` when building the role map. */
+const MAX_PROFILE_ROWS = 20_000;
 
 /** Cap on favorite rows aggregated for the "most saved" ranking. */
 const MAX_FAVORITE_ROWS = 5_000;
@@ -86,7 +89,7 @@ function providerOf(user: User): string {
 }
 
 /** Map an auth user onto the row shape the moderation table renders. */
-export function toUserRow(user: User): AdminUserRow {
+export function toUserRow(user: User, roles: Map<string, UserRole>): AdminUserRow {
   const createdAt = user.created_at ? Date.parse(user.created_at) : 0;
   const lastSignIn = user.last_sign_in_at ? Date.parse(user.last_sign_in_at) : 0;
 
@@ -96,12 +99,47 @@ export function toUserRow(user: User): AdminUserRow {
     name: displayName(user),
     createdAt: Number.isFinite(createdAt) ? createdAt : 0,
     lastSignInAt: Number.isFinite(lastSignIn) ? lastSignIn : 0,
-    role: isAdminEmail(user.email) ? "admin" : "member",
+    /** A missing row is the normal state and reads as `user`. */
+    role: roles.get(user.id) ?? "user",
     suspended: isSuspended(user),
     bannedUntil: bannedUntil(user),
     emailConfirmed: Boolean(user.email_confirmed_at),
     provider: providerOf(user),
   };
+}
+
+/**
+ * The role map for the directory.
+ *
+ * `public.profiles` is sparse by design — only promoted accounts have a row (and
+ * the signup trigger writes `user` for everyone else), so this is a small read
+ * and the table doubles as the "who has console access" list. `role` is a single
+ * indexed-by-primary-key column, so reading it whole is cheaper than a per-user
+ * round trip for a page of results.
+ *
+ * An unreadable table (most often: the `profiles_roles` migration has not been
+ * applied) yields an empty map rather than an error; every account then reads as
+ * `user`, which is the safe direction.
+ */
+async function loadUserRoles(client: SupabaseClient): Promise<Map<string, UserRole>> {
+  const roles = new Map<string, UserRole>();
+
+  try {
+    const { data, error } = await client
+      .from(PROFILES_TABLE)
+      .select("id, role")
+      .limit(MAX_PROFILE_ROWS);
+
+    if (error) throw error;
+
+    for (const row of (data ?? []) as { id: string | null; role: unknown }[]) {
+      if (row.id) roles.set(row.id, normalizeRole(row.role));
+    }
+  } catch {
+    // See above: an empty map is the correct reading of "no role granted".
+  }
+
+  return roles;
 }
 
 function dayKeys(days: number): string[] {
@@ -222,10 +260,12 @@ export async function loadFavoriteCounts(
 /**
  * A page of the user directory.
  *
- * Search is applied after fetching the page rather than in the query, because
- * Supabase's admin API exposes no server-side search. With the default page size
- * that is fine for the sizes this app operates at; a deployment with tens of
- * thousands of accounts should move this to a `profiles` table with an index.
+ * The directory itself is Supabase's `auth.users` (the authority on who has an
+ * account); `public.profiles` is joined in only for the `role` column. Search is
+ * applied after fetching the page rather than in the query, because Supabase's
+ * admin API exposes no server-side search. With the default page size that is
+ * fine for the sizes this app operates at; a deployment with tens of thousands
+ * of accounts should move the listing onto an indexed table of its own.
  */
 export async function listUsers(
   client: SupabaseClient | null,
@@ -247,6 +287,8 @@ export async function listUsers(
   }
 
   try {
+    const roles = await loadUserRoles(client);
+
     if (search) {
       // Search needs the whole (bounded) directory to filter; the app's account
       // counts make that affordable, and the loop is capped either way.
@@ -261,7 +303,7 @@ export async function listUsers(
         if (error) throw error;
 
         for (const user of data.users) {
-          const row = toUserRow(user);
+          const row = toUserRow(user, roles);
           const haystack = `${row.name} ${row.email ?? ""} ${row.id}`.toLowerCase();
           if (haystack.includes(search)) matches.push(row);
         }
@@ -284,7 +326,7 @@ export async function listUsers(
     if (error) throw error;
 
     return {
-      users: data.users.map(toUserRow),
+      users: data.users.map((user) => toUserRow(user, roles)),
       total: typeof data.total === "number" ? data.total : data.users.length,
       page,
       perPage,
@@ -298,6 +340,54 @@ export async function listUsers(
       perPage,
       available: false,
       reason: error instanceof Error ? error.message : "Supabase user query failed.",
+    };
+  }
+}
+
+/**
+ * Grant or revoke console access by writing `role` in `public.profiles`.
+ *
+ * `role` is the whole point of this write; the account's identity lives in
+ * `auth.users`. The live `profiles` row also carries the address, so it is
+ * refreshed here where available — as a bonus, that satisfies a legacy
+ * `email text not null` column instead of failing on it.
+ *
+ * `id` is the primary key, so an upsert is both the "this account has no row
+ * yet" path (most accounts do not) and a safe one when two administrators
+ * promote the same person at once.
+ */
+export async function setUserRole(
+  client: SupabaseClient | null,
+  userId: string,
+  role: UserRole
+): Promise<{ ok: boolean; message: string }> {
+  if (!client) {
+    return { ok: false, message: "Supabase admin access is not configured." };
+  }
+
+  try {
+    // Best effort: a missing address must not stop the role from being set.
+    const { data: authUser } = await client.auth.admin.getUserById(userId);
+
+    const row: { id: string; role: UserRole; email?: string } = { id: userId, role };
+    const address = authUser?.user?.email;
+    if (address) row.email = address;
+
+    const { error } = await client.from(PROFILES_TABLE).upsert(row, { onConflict: "id" });
+
+    if (error) throw error;
+
+    return {
+      ok: true,
+      message:
+        role === "admin"
+          ? "Console access granted. It applies on their next page load."
+          : "Console access revoked. They keep using the player.",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : "The role change failed.",
     };
   }
 }

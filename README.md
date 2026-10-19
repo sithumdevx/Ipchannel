@@ -70,10 +70,21 @@ Secure, **account-only** access powered by Supabase Auth — **Google Sign-In** 
 **Email / Username registration** with email confirmation. **No guest mode:** unauthenticated
 visitors are bounced by the edge proxy to the sign-in wall before ever reaching the player.
 
-### ⚡ Instant Post-Login Navigation
-Fresh sign-ins are automatically routed straight into the channel player (`/watch`) — via the
-OAuth callback (`/auth/callback?next=/watch`) and the profile sync layer — so returning users
-land on the action, not on a passive landing page.
+### ⚡ Role-Aware Post-Login Navigation
+Fresh sign-ins land on the page their account's role owns: **administrators** are routed to the
+admin console (`/admin`), **everyone else** to the player (`/watch`). The role lives in
+`public.profiles` and is read server-side by the OAuth callback
+(`/auth/callback?next=/watch`) and by the profile sync layer for in-tab email/password sign-ins —
+one shared rule, so the two paths cannot disagree.
+
+### 👥 Admin Console & User Roles
+A `/admin` console (system metrics, stream health, broadcast banner, user management) gated on
+`role = 'admin'` in `public.profiles`. The check runs server-side on every request using the
+caller's own credentials, so **row-level security — not the UI — is what enforces it**, and anyone
+else gets a dark-themed **403 Access Denied** screen instead of a redirect. Administrators can
+**promote or demote** any other account from the User Management tab; role changes apply on that
+account's next page load and are written through the service role, so a client can never set its
+own role.
 
 ### 🩺 5-Minute Automated Stream Health Checker
 A background verifier probes streams on a rolling 5-minute TTL (driven by an in-process
@@ -150,20 +161,22 @@ ipchannel/
 │   ├── app/
 │   │   ├── page.tsx               # Cinematic landing page
 │   │   ├── watch/page.tsx         # Protected player view + filters
+│   │   ├── admin/                 # Console (metrics, streams, users, broadcast) + 403 screen
 │   │   ├── developer/page.tsx     # Developer profile
+│   │   ├── api/admin/             # Console APIs (all gated on requireAdmin)
 │   │   ├── api/channels/          # Catalogue + search/category/country filters
 │   │   ├── api/proxy/             # CORS-bypass M3U8 proxy
 │   │   ├── api/health/            # Stream-health cron & probes
 │   │   ├── api/ping/              # Latency probe for the diagnostics badge
-│   │   └── auth/callback/         # OAuth/email confirmation → /watch
+│   │   └── auth/callback/         # OAuth/email confirmation → role landing page
 │   ├── components/                # VideoPlayer, ChannelCard, CountryFilter, AuthModal …
 │   ├── context/                   # ProfileContext (favorites/history), ThemeContext
 │   ├── hooks/                     # useConnectionQuality (probe + Network Information API)
-│   ├── lib/                       # m3u-parser, stream-health, countries, security/*
+│   ├── lib/                       # m3u-parser, stream-health, countries, admin, user-role, security/*
 │   ├── proxy.ts                   # Edge middleware: auth gate, rate limits, headers
 │   └── types/iptv.ts              # Shared channel models
 ├── supabase/
-│   ├── migrations/                # RLS + security hardening SQL
+│   ├── migrations/                # RLS + security hardening + profiles/roles SQL
 │   └── audit_rls.sql              # Read-only RLS verification
 ├── SECURITY.md                    # Security audit & hardening notes
 └── vercel.json                    # 5-minute health cron
@@ -205,17 +218,31 @@ HEALTH_CRON_SECRET="generate-a-long-random-string"
 
 See [Environment Variables](#-environment-variables) for the full reference.
 
-### 3 · Enable Row Level Security
+### 3 · Initialize the database (RLS + roles)
 
-In the Supabase Dashboard → **SQL Editor**, run the migration, then verify it:
+In the Supabase Dashboard → **SQL Editor**, run both migrations, then verify:
 
 ```bash
 # 1. Paste & Run:  supabase/migrations/20261018120000_security_hardening.sql
-# 2. Verify (read-only): supabase/audit_rls.sql
+# 2. Paste & Run:  supabase/migrations/20261019000000_profiles_roles.sql
+# 3. Verify (read-only): supabase/audit_rls.sql
 ```
 
 Expected: every `public` table reports `rls_enabled = t`, `rls_forced = t`, and the audit
 prints `OK: all public tables have RLS enabled.` — details in [`SECURITY.md`](./SECURITY.md).
+
+The second migration sets up `public.profiles`, whose `role` column (`user` / `admin`) is the
+**entire** authorization model: `admin` may open `/admin`, everyone else gets the 403 screen.
+Every account defaults to `user`. Promote yourself to bootstrap the first administrator, then sign
+out and back in:
+
+```sql
+insert into public.profiles (id, role)
+select id, 'admin' from auth.users where email = 'you@example.com'
+on conflict (id) do update set role = excluded.role;
+```
+
+After that, use the console's **User Management** tab to promote or demote anyone else.
 
 ### 4 · Run the development server
 
@@ -223,8 +250,9 @@ prints `OK: all public tables have RLS enabled.` — details in [`SECURITY.md`](
 npm run dev
 ```
 
-Open **[http://localhost:3000](http://localhost:3000)**, create an account (Google or email),
-and you will be redirected straight into the player at **`/watch`**.
+Open **[http://localhost:3000](http://localhost:3000)** and create an account (Google or email):
+a normal account is redirected into the player at **`/watch`**, while an account whose
+`profiles.role` is `admin` lands on the console at **`/admin`**.
 
 ---
 
@@ -243,6 +271,7 @@ and you will be redirected straight into the player at **`/watch`**.
 | :-- | :-- | :-- |
 | `STREAM_SOURCES` | — | Comma-separated M3U/M3U8 playlist URLs. Unset → built-in verified channels |
 | `HEALTH_CRON_SECRET` | — | Bearer secret protecting `/api/health?sweep=1` (set `CRON_SECRET` to the same value on Vercel) |
+| `SUPABASE_SERVICE_ROLE_KEY` | — | Server-only. Enables the console's user directory and **promote/demote** (both bypass RLS by design). Never expose it with a `NEXT_PUBLIC_` prefix |
 | `RATE_LIMIT_PROXY_PER_MIN` | `600` | Per-IP proxy requests / minute |
 | `RATE_LIMIT_CHANNELS_PER_MIN` | `60` | Per-IP catalogue requests / minute |
 | `RATE_LIMIT_API_PER_MIN` | `120` | Per-IP generic API requests / minute |

@@ -10,8 +10,9 @@ import { collectAdminStats } from "@/lib/admin-stats";
  * without any risk of a GET accidentally changing state.
  *
  * Access is enforced here rather than in the UI. `requireAdmin()` validates the
- * session token against Supabase and checks the `ADMIN_EMAILS` allowlist, so the
- * route is safe even if the dashboard page were bypassed entirely.
+ * session token against Supabase and reads the account's `role` from
+ * `public.profiles`, so the route is safe even if the dashboard page were
+ * bypassed entirely.
  *
  * Nothing here is cacheable — every response is `no-store`, because a cached
  * analytics blob served to the wrong session would be a leak.

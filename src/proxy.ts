@@ -6,10 +6,13 @@ import { checkSameOrigin, getClientIp } from "@/lib/security/origin-guard";
  * Security gate, running before the route handlers.
  *
  * Enforces, in order:
- *   0. Edge auth for `/watch` and `/admin` — visitors without a Supabase
- *      session cookie get a clean 307 redirect to `/?login=true` (which
- *      auto-opens the auth modal), never a raw JSON error body and never a
- *      streamed client-side redirect.
+ *   0. Edge auth for `/watch` — visitors without a Supabase session cookie get a
+ *      clean 307 redirect to `/?login=true` (which auto-opens the auth modal),
+ *      never a raw JSON error body and never a streamed client-side redirect.
+ *      `/admin` is deliberately *not* gated here: it is a page, its answer
+ *      depends on a role that lives in the database, and an anonymous visitor is
+ *      better served by its explanatory 403 screen (with a sign-in button) than
+ *      by a redirect they did not ask for.
  *   1. Same-origin policy on `/api/*` (blocks other sites driving the API from
  *      a browser context, and dumb cross-site scrapers) — `Sec-Fetch-Site` +
  *      `Origin` checks. Never applied to page routes: cross-site navigations
@@ -90,34 +93,10 @@ function deny(
 /** Routes that require an authenticated Supabase session. */
 const PROTECTED_PATHS = ["/watch"];
 
-/** Routes that additionally require an administrator (checked in the page). */
-const ADMIN_PATHS = ["/admin"];
-
-function isAdminPath(pathname: string): boolean {
-  return ADMIN_PATHS.some(
-    (path) => pathname === path || pathname.startsWith(`${path}/`)
-  );
-}
-
 function isProtectedPath(pathname: string): boolean {
   return PROTECTED_PATHS.some(
     (path) => pathname === path || pathname.startsWith(`${path}/`)
   );
-}
-
-/**
- * Is any administrator account configured?
- *
- * Deliberately re-derived here instead of imported from `@/lib/admin`: that
- * module pulls in `next/headers` and the Supabase server client, neither of
- * which belongs in the proxy runtime. The predicate only decides *whether it is
- * worth showing a sign-in form* — it never grants access, so a duplicate one
- * line check is a better trade than splitting the module.
- */
-function adminsConfigured(): boolean {
-  return (process.env.ADMIN_EMAILS ?? "")
-    .split(",")
-    .some((entry) => entry.trim().includes("@"));
 }
 
 /** Bounce to the landing page with the auth modal open. */
@@ -165,20 +144,11 @@ export function proxy(request: NextRequest) {
     }
   }
 
-  // 0a) /admin gets the same edge gate, but only when an allowlist exists. With
-  //     `ADMIN_EMAILS` unset there is no admin to sign in as, so the page's
-  //     one-time setup instructions are more useful than a login form that
-  //     cannot grant access — let the page render those instead.
-  //
-  //     This is a UX redirect, not the authorization check. It only proves *a*
-  //     Supabase cookie exists; whether that cookie belongs to an administrator
-  //     is decided inside the page and re-decided on every `/api/admin/*`
-  //     request. Without it, an anonymous visit would be answered by a streamed
-  //     client-side redirect (a 200 with an error shell), which is slower and
-  //     flashes an error page before landing.
-  if (isAdminPath(pathname) && adminsConfigured() && !findSessionCookie(request)) {
-    return loginRedirect(request);
-  }
+  // 0a) `/admin` is intentionally absent from the edge gate above. Its gate is a
+  //     `role` column that only the database knows, so the edge could only prove
+  //     that *a* Supabase cookie exists — which is not the question. The page
+  //     answers it properly and renders a 403 with a sign-in button for
+  //     everyone it turns away, including visitors with no session at all.
 
   // 1) API hardening — origin & rate-limit checks only apply to /api/*.
   //    Page routes (like /watch) are excluded on purpose: browsers following

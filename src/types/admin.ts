@@ -5,6 +5,8 @@
  * contract without either importing the other's module graph.
  */
 
+import type { UserRole } from "@/lib/user-role";
+
 /* -------------------------------------------------------------------------- */
 /* Channels                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -73,8 +75,8 @@ export interface AdminUserRow {
   name: string;
   createdAt: number;
   lastSignInAt: number;
-  /** `admin` when the email is on the ADMIN_EMAILS allowlist. */
-  role: "admin" | "member";
+  /** Role from `public.profiles`: `admin` opens the console, `user` does not. */
+  role: UserRole;
   /** True when the account is currently banned in Supabase. */
   suspended: boolean;
   /** ISO timestamp the ban lifts, when known. */

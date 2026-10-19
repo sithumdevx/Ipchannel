@@ -1,5 +1,6 @@
 import { createBrowserClient } from "@supabase/ssr";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { normalizeRole, PROFILES_TABLE, type UserRole } from "@/lib/user-role";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
@@ -107,3 +108,32 @@ export const supabase = new Proxy({} as SupabaseClient, {
     return val;
   },
 });
+
+/**
+ * Read the signed-in account's role from `public.profiles`.
+ *
+ * Called right after a sign-in to decide between `/admin` and `/watch`. The
+ * query runs as the caller, so row-level security limits it to their own row —
+ * and because `authenticated` holds no write privilege on that table, the value
+ * cannot be nudged from the browser. A missing row, an unreachable table, or an
+ * unexpected value all resolve to `user`; see `normalizeRole`.
+ */
+export async function fetchUserRole(userId: string): Promise<UserRole> {
+  const client = getSupabase();
+  if (!client) return "user";
+
+  try {
+    const { data, error } = await client
+      .from(PROFILES_TABLE)
+      .select("role")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) return "user";
+    return normalizeRole((data as { role?: unknown } | null)?.role);
+  } catch {
+    // Fail safe: an unreadable role is never an upgrade.
+    return "user";
+  }
+}
+

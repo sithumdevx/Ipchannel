@@ -1,6 +1,8 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import { NextResponse, type NextRequest } from "next/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { landingPathForRole, normalizeRole, PROFILES_TABLE, type UserRole } from "@/lib/user-role";
 
 /**
  * Open-redirect protection.
@@ -56,6 +58,49 @@ function resolveOrigin(request: NextRequest): string {
   return request.nextUrl.origin;
 }
 
+/**
+ * Landing targets that carry no intent of their own — a bare "take me to the
+ * app". The account's role decides these, not the query string.
+ */
+const GENERIC_TARGETS = new Set(["/watch", "/"]);
+
+/**
+ * Where a freshly authenticated visitor should land.
+ *
+ * The role owns the default destination: `admin` → `/admin`, `user` → `/watch`.
+ * A caller-supplied `next` is honoured only when it points somewhere specific
+ * (a deep link such as `/watch?channel=42`); every current flow passes an
+ * explicit `/watch`, and letting that win would strand admins in the player.
+ */
+function resolveDestination(next: string, role: UserRole): string {
+  return GENERIC_TARGETS.has(next) ? landingPathForRole(role) : next;
+}
+
+/**
+ * Read the account's role with the credentials just established.
+ *
+ * Runs against the newly-set session cookies, so RLS narrows the query to the
+ * caller's own row. Every failure mode — no user on the session, a missing row,
+ * an unreadable table — resolves to `user`: a sign-in must never fail, and an
+ * unreadable role must never grant the console.
+ */
+async function readRole(supabase: SupabaseClient, userId: string | null): Promise<UserRole> {
+  if (!userId) return "user";
+
+  try {
+    const { data, error } = await supabase
+      .from(PROFILES_TABLE)
+      .select("role")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) return "user";
+    return normalizeRole((data as { role?: unknown } | null)?.role);
+  } catch {
+    return "user";
+  }
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
   const code = searchParams.get("code");
@@ -100,11 +145,15 @@ export async function GET(request: NextRequest) {
       },
     });
 
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code);
     if (!error) {
-      // Session cookies are now set on this response — hand the user straight
-      // back to the player (`/watch` by default) on the same origin.
-      return NextResponse.redirect(`${origin}${next}`, { headers: noStore });
+      // The session cookies are set on *this* response, so the role can be read
+      // with the caller's own credentials before deciding where to send them.
+      const userId = data.user?.id ?? data.session?.user?.id ?? null;
+      const destination = resolveDestination(next, await readRole(supabase, userId));
+
+      // Hand the visitor to their role's landing page on the same origin.
+      return NextResponse.redirect(`${origin}${destination}`, { headers: noStore });
     }
     // Log the reason only — never echo provider internals to the client.
     console.error("OAuth code exchange failed:", error.message);

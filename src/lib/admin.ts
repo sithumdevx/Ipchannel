@@ -1,20 +1,29 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import { normalizeRole, PROFILES_TABLE, type UserRole } from "@/lib/user-role";
 
 /**
- * Server-side admin authorization.
+ * Server-side authorization.
  *
- * Everything under `/admin` and `/api/admin/*` is gated on an explicit
- * allowlist of email addresses (`ADMIN_EMAILS`, comma-separated). The *only*
- * trusted input is the Supabase access token carried in the request cookies:
- * it is validated against the Supabase Auth server (`auth.getUser()`) and the
- * email on the resulting user record is what gets checked against the
- * allowlist. Nothing client-supplied — no header, no body field, no local
- * storage — can grant admin access.
+ * Console access is a row in `public.profiles` whose `role` is `admin`, and
+ * nothing else. The only trusted input is the Supabase access token carried in
+ * the request cookies: it is validated against the Supabase Auth server
+ * (`auth.getUser()` — the token is *verified*, not merely decoded), and the
+ * `role` on that account's profile row is what decides. Nothing client-supplied
+ * — no header, no body field, no local storage — can grant access.
  *
- * With no allowlist configured there are deliberately *no* admins. The
- * dashboard then renders instructions for configuring one instead of quietly
- * opening itself to every signed-in account.
+ * The role is read with the *caller's own* credentials, so row-level security
+ * does the filtering. The migration gives `authenticated` a single SELECT policy
+ * matching `auth.uid() = id` and no write privilege at all, which means a member
+ * can neither read somebody else's row nor promote themselves — the console's
+ * promote/demote goes through the service role instead.
+ *
+ * Everything here fails closed. A missing row, an unreadable table, a missing
+ * Supabase configuration — each of them means "not an administrator", never the
+ * opposite. `error` exists so the console can tell an operator *why* it could
+ * not answer (usually: the migration has not been applied), not so the answer
+ * can be loosened.
  */
 
 export interface SessionIdentity {
@@ -24,31 +33,24 @@ export interface SessionIdentity {
   avatarUrl?: string;
 }
 
-/** Read + normalise `ADMIN_EMAILS` (comma-separated, case-insensitive). */
-export function adminEmails(): string[] {
-  const raw = process.env.ADMIN_EMAILS;
-  if (!raw) return [];
-
-  return Array.from(
-    new Set(
-      raw
-        .split(",")
-        .map((entry) => entry.trim().toLowerCase())
-        .filter((entry) => entry.includes("@"))
-    )
-  );
+/**
+ * The result of resolving who is calling and what they may do.
+ *
+ * `error` distinguishes "this account is not an administrator" from "the
+ * question could not be answered", which is what lets the 403 page explain a
+ * missing migration instead of dead-ending. It is only ever surfaced to a
+ * signed-in caller.
+ */
+export interface AdminAccess {
+  identity: SessionIdentity | null;
+  /** The role on the account's profile row; `null` when the row was unreadable. */
+  role: UserRole | null;
+  admin: boolean;
+  /** Why the role could not be read — `null` when the lookup ran. */
+  error: string | null;
 }
 
-/** True when at least one admin account is configured. */
-export function adminConfigured(): boolean {
-  return adminEmails().length > 0;
-}
-
-/** Case-insensitive allowlist check. */
-export function isAdminEmail(email: string | null | undefined): boolean {
-  if (!email) return false;
-  return adminEmails().includes(email.trim().toLowerCase());
-}
+const ANONYMOUS: AdminAccess = { identity: null, role: null, admin: false, error: null };
 
 /** Supabase credentials used for server-side session validation. */
 function serverCredentials(): { url: string; key: string } | null {
@@ -59,33 +61,42 @@ function serverCredentials(): { url: string; key: string } | null {
 }
 
 /**
- * Resolve the caller's identity from the Supabase session cookie.
+ * True when this server holds the credentials it needs to authenticate at all.
  *
- * Returns `null` for anonymous callers, when Supabase is not configured, or
- * when the token fails server-side validation. `getUser()` is intentionally
- * used over `getSession()`: the former verifies the token with Supabase, the
- * latter only decodes what the (client-writable) cookie claims.
+ * Exposed so a page can tell "you are not allowed in" apart from "nobody can
+ * sign in yet", without duplicating the environment check.
  */
-export async function getSessionIdentity(): Promise<SessionIdentity | null> {
+export function authBackendConfigured(): boolean {
+  return serverCredentials() !== null;
+}
+
+/**
+ * A Supabase client bound to the caller's cookies, or `null` when Supabase is
+ * not configured. The client is deliberately created per call: a server
+ * component, a route handler, and a proxy do not share a request scope, and the
+ * cost of construction is trivial next to the network call it precedes.
+ */
+async function sessionClient(): Promise<SupabaseClient | null> {
   const credentials = serverCredentials();
   if (!credentials) return null;
 
-  let supabase;
   try {
     const cookieStore = await cookies();
-    supabase = createServerClient(credentials.url, credentials.key, {
+    return createServerClient(credentials.url, credentials.key, {
       cookies: {
         getAll() {
           return cookieStore.getAll();
         },
         setAll(cookiesToSet) {
+          // Called when Supabase rotates the access token. Server Components
+          // cannot write cookies, so a rotation here is dropped and the browser
+          // persists the refreshed token on its next request instead.
           try {
             cookiesToSet.forEach(({ name, value, options }) =>
               cookieStore.set(name, value, options)
             );
           } catch {
-            // Server Components cannot mutate cookies. The refresh is a no-op
-            // here; the session is still readable for this request.
+            // Read-only cookie store — nothing to do.
           }
         },
       },
@@ -93,15 +104,15 @@ export async function getSessionIdentity(): Promise<SessionIdentity | null> {
   } catch {
     return null;
   }
+}
 
+/** Validate the session cookie with the Auth server and map it to an identity. */
+async function readIdentity(supabase: SupabaseClient): Promise<SessionIdentity | null> {
   try {
-    const {
-      data: { user },
-      error,
-    } = await supabase.auth.getUser();
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user) return null;
 
-    if (error || !user) return null;
-
+    const user = data.user;
     const meta = user.user_metadata ?? {};
     const name =
       meta.display_name ||
@@ -111,11 +122,13 @@ export async function getSessionIdentity(): Promise<SessionIdentity | null> {
       user.email?.split("@")[0] ||
       "User";
 
+    const avatar = meta.avatar_url || meta.picture || undefined;
+
     return {
       id: user.id,
       email: user.email ?? null,
       name,
-      avatarUrl: meta.avatar_url || meta.picture || undefined,
+      avatarUrl: typeof avatar === "string" ? avatar : undefined,
     };
   } catch {
     return null;
@@ -123,30 +136,90 @@ export async function getSessionIdentity(): Promise<SessionIdentity | null> {
 }
 
 /**
- * Identity of the caller *only* when they are on the admin allowlist.
- * `null` means "not an admin" — never distinguish "not signed in" here, so the
- * caller cannot probe whether an email is a known admin account.
+ * Read one account's role.
+ *
+ * Only ever called with the *caller's own* id, so the RLS policy is the
+ * authority on whether the row may be seen. A missing row is not an error — the
+ * overwhelming majority of accounts never get one written, and `user` is the
+ * correct reading of "no role granted".
  */
-export async function getAdminIdentity(): Promise<SessionIdentity | null> {
-  const identity = await getSessionIdentity();
-  if (!identity || !isAdminEmail(identity.email)) return null;
-  return identity;
+async function readRole(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<{ role: UserRole | null; error: string | null }> {
+  try {
+    const { data, error } = await supabase
+      .from(PROFILES_TABLE)
+      .select("role")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) {
+      return {
+        role: null,
+        error: `Could not read public.${PROFILES_TABLE}: ${error.message}`,
+      };
+    }
+
+    return { role: normalizeRole((data as { role?: unknown } | null)?.role), error: null };
+  } catch (cause) {
+    return {
+      role: null,
+      error: cause instanceof Error ? cause.message : "The role lookup failed.",
+    };
+  }
+}
+
+/**
+ * Who is calling, and whether that means console access — in a single pass.
+ *
+ * One cookie read and at most one extra query, so a page and a route handler
+ * cannot end up asking two subtly different questions.
+ */
+export async function resolveAdminAccess(): Promise<AdminAccess> {
+  const supabase = await sessionClient();
+  if (!supabase) {
+    return {
+      ...ANONYMOUS,
+      error:
+        "Supabase is not configured on the server (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY).",
+    };
+  }
+
+  const identity = await readIdentity(supabase);
+  if (!identity) return ANONYMOUS;
+
+  const { role, error } = await readRole(supabase, identity.id);
+  return { identity, role, admin: role === "admin", error };
+}
+
+/**
+ * The caller's identity from the Supabase session cookie, or `null`.
+ *
+ * `null` covers every unauthenticated case at once — no cookie, an expired or
+ * forged token, Supabase unconfigured — deliberately, so callers cannot tell
+ * them apart.
+ */
+export async function getSessionIdentity(): Promise<SessionIdentity | null> {
+  const supabase = await sessionClient();
+  return supabase ? readIdentity(supabase) : null;
 }
 
 /**
  * JSON guard for admin API routes.
  *
- * Returns a `403` response for non-admins so a route can bail out early:
+ * Returns a `401`/`403` response for anyone who is not an administrator, so a
+ * route can bail out before it reads the body:
  *
- *   const denied = await requireAdmin();
- *   if (denied) return denied;
+ *   const gate = await requireAdmin();
+ *   if (!gate.ok) return gate.response;
  */
 export async function requireAdmin(): Promise<
   { ok: true; admin: SessionIdentity } | { ok: false; response: Response }
 > {
-  const admin = await getSessionIdentity();
+  const access = await resolveAdminAccess();
 
-  if (!admin) {
+  if (!access.identity) {
     return {
       ok: false,
       response: Response.json(
@@ -156,7 +229,7 @@ export async function requireAdmin(): Promise<
     };
   }
 
-  if (!isAdminEmail(admin.email)) {
+  if (!access.admin) {
     return {
       ok: false,
       response: Response.json(
@@ -166,5 +239,5 @@ export async function requireAdmin(): Promise<
     };
   }
 
-  return { ok: true, admin };
+  return { ok: true, admin: access.identity };
 }

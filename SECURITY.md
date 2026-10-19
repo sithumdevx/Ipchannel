@@ -1,6 +1,7 @@
 # StreamPulse — Security Hardening Notes
 
-Last updated: 2026-10-18 · Scope: production-readiness audit + implementation.
+Last updated: 2026-10-19 · Scope: production-readiness audit + implementation, plus
+role-based console access (`public.profiles.role`) and role-aware post-login routing.
 
 This document lists what is enforced in code, **the one step you must run in
 Supabase yourself**, and the residual risks you should knowingly accept.
@@ -20,6 +21,8 @@ Security is the only access control for user data.**
 | `UPDATE` policy (required for the app's `upsert()`) | ✅ — this was **missing** from the original snippet |
 | `anon` role privileges revoked on user data | ✅ in the migration |
 | Optional `profiles` table hardened if present | ✅ guarded block |
+| `public.profiles` **created** with `role` (`user`/`admin`), RLS forced, `authenticated` granted **SELECT only** | ✅ `supabase/migrations/20261019000000_profiles_roles.sql` |
+| Role changes blocked at the trigger level as well as by privilege | ✅ `guard_role_change()` |
 | Every other table in `public` swept to RLS ON + FORCED | ✅ with `NOTICE` list of now-unreachable tables |
 | **Applied to your actual database** | ❌ **you must run it** |
 
@@ -142,6 +145,27 @@ Migration path to a strict nonce CSP: make the shell dynamic and follow
 - `httpOnly` is intentionally **not** set on the session cookie: `@supabase/ssr`
   stores the session where client JS must read it. The real boundary is RLS +
   the 30-day lifetime — do not store anything sensitive in `user_metadata`.
+- **Console authorization is a database role, not an allowlist.** `/admin` and
+  every `/api/admin/*` route call `requireAdmin()`, which validates the session
+  token against Supabase and then reads `role` from `public.profiles` **with the
+  caller's own credentials**. RLS narrows that read to the caller's own row, and
+  `authenticated` holds no `INSERT`/`UPDATE`/`DELETE` privilege on the table, so
+  a member can neither read anyone else's role nor grant themselves `admin`.
+  A `before update` trigger (`guard_role_change`) refuses any `role` change that
+  does not come from the service role, covering the case where a future grant
+  widens write access. Everything fails closed: a missing row, a missing table,
+  or an unreachable project all resolve to "not an administrator".
+- **Post-login redirection is role-driven and shared.** The OAuth callback and
+  the in-tab sign-in handler both resolve `/watch` (a generic target) to
+  `landingPathForRole(role)` — `/admin` for administrators, `/watch` otherwise —
+  so the two paths cannot diverge. An explicit deep link (e.g.
+  `/watch?channel=42`) is still honoured after sanitization.
+- **The `/admin` refusal is a page, not a redirect.** A 403 screen explains which
+  account is signed in and offers sign-in / switch-account / back-to-player, and
+  surfaces setup errors (missing migration, unconfigured Supabase) to the
+  operator. The edge proxy deliberately does **not** gate `/admin`: it could only
+  prove that *a* cookie exists, which is not the question, and a redirect would
+  hide the real reason.
 
 ## 5. Verification performed
 
@@ -170,6 +194,19 @@ Migration path to a strict nonce CSP: make the shell dynamic and follow
   `medianOf` / the formatters / the SSR guards, and 36 over the telemetry
   store's reference-stability and change-detection contract.
 - `npx next build` → clean, with `/api/ping` reported as a static route.
+- Role-based access control (`public.profiles.role`):
+  - `npx tsc --noEmit` → clean; `npx eslint src` → unchanged at the pre-existing
+    4 errors / 14 warnings, none in a touched file
+  - `npx next build` → clean; `/admin` reported as `ƒ (Dynamic)`, `/watch` still `○ (Static)`
+  - anonymous `GET /admin` → **200** with the dark 403 screen (`Error 403` /
+    `Access Denied` / `Sign in with Google`), no operator-notes block, and no
+    redirect
+  - anonymous `GET /api/admin/me` → `{"admin":false,"email":null}` (200);
+    `GET /api/admin/users` and `/api/admin/stats` → **401**
+    `{"error":"Authentication required."}`
+  - a forged `sb-…-auth-token` cookie → `/admin` still **200 + 403** (fail
+    closed: `auth.getUser()` rejects it) and `/watch` still **200**, while
+    anonymous `/watch` still **307**s to `/?login=true`
 
 ## 6. Residual risks — accepted, not solved
 
@@ -199,6 +236,11 @@ Migration path to a strict nonce CSP: make the shell dynamic and follow
 | File | Purpose |
 | --- | --- |
 | `supabase/migrations/20261018120000_security_hardening.sql` | RLS enable + strict policies + least-privilege grants (**run this**) |
+| `supabase/migrations/20261019000000_profiles_roles.sql` | `public.profiles` + `role`, RLS, SELECT-only grants, role guard trigger (**run this**) |
+| `src/lib/user-role.ts` | the role contract: `UserRole`, `normalizeRole` (fail-closed), `landingPathForRole` |
+| `src/lib/admin.ts` | server-side `resolveAdminAccess()` / `requireAdmin()` — session validation + own-row role read |
+| `src/lib/admin-supabase.ts` | service-role directory, moderation, and `setUserRole()` (promote/demote) |
+| `src/app/admin/AccessDenied.tsx` | dark-themed 403 screen (sign in / switch account / back to player) |
 | `supabase/audit_rls.sql` | read-only audit: RLS status, policies, grants, SECURITY DEFINER fns, view invoker |
 | `src/proxy.ts` | pre-API gate: cross-site blocking, per-IP rate limits, robots headers |
 | `src/lib/security/rate-limit.ts` | fixed-window in-memory limiter (drop-in replaceable) |

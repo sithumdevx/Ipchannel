@@ -4,7 +4,8 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { User } from "@supabase/supabase-js";
 import { useRouter } from "next/navigation";
 import { Channel } from "@/types/iptv";
-import { getSupabase, isSupabaseConfigured } from "@/lib/supabase";
+import { getSupabase, isSupabaseConfigured, fetchUserRole } from "@/lib/supabase";
+import { landingPathForRole } from "@/lib/user-role";
 
 export interface UserProfile {
   id: string;
@@ -98,11 +99,18 @@ function friendlyAuthError(raw: string): string {
 
 const ProfileContext = createContext<ProfileContextType | undefined>(undefined);
 
-/** Pages that are pure marketing/landing views — never the channel experience. */
-const LANDING_PATHS = ["/", "/developer", "/about"];
-
-function isLandingPath(pathname: string | null): boolean {
-  return Boolean(pathname && LANDING_PATHS.includes(pathname));
+/**
+ * Where a fresh sign-in should send the account, or `null` to stay put.
+ *
+ * The console is excluded so a refresh there can never loop, and a URL that
+ * already names its own destination (a deep link such as `/watch?channel=42`)
+ * is left alone: this answers "where does a fresh sign-in go", not "where does
+ * this link go". Every other surface — the marketing pages *and* the app views
+ * behind the auth wall — is fair game, because the role's landing page is
+ * exactly what a sign-in is supposed to produce.
+ */
+function shouldLandOnRole(pathname: string, search: string): boolean {
+  return pathname !== "/admin" && search.length <= 1;
 }
 
 export function ProfileProvider({ children }: { children: React.ReactNode }) {
@@ -222,16 +230,28 @@ export function ProfileProvider({ children }: { children: React.ReactNode }) {
   }, [fetchSupabaseFavorites]);
 
   /**
-   * Post-login landing target: the main channel browsing/player view.
-   * Only fires while the user is on a marketing page (Home hero, developer
-   * page) so navigation inside the player itself is never hijacked.
+   * Post-login landing target, chosen by the account's role.
+   *
+   * Admins land in the console, everyone else in the player — `admin` comes
+   * from `public.profiles`, and an unreadable role resolves to `user`. This
+   * shares `landingPathForRole` with the OAuth callback, which performs the
+   * same decision server-side, so the two paths cannot disagree.
+   *
+   * Only fires when `shouldLandOnRole` says the current URL has no destination
+   * of its own, so a deep link such as `/watch?channel=42` is left where it is
+   * and the console cannot redirect to itself.
    */
-  const redirectToChannelView = useCallback(() => {
-    if (typeof window === "undefined") return;
-    if (isLandingPath(window.location.pathname)) {
-      router.replace("/watch");
-    }
-  }, [router]);
+  const redirectAfterSignIn = useCallback(
+    async (userId: string) => {
+      if (typeof window === "undefined") return;
+
+      const { pathname, search } = window.location;
+      if (!shouldLandOnRole(pathname, search)) return;
+
+      router.replace(landingPathForRole(await fetchUserRole(userId)));
+    },
+    [router]
+  );
 
   // Handle Supabase Auth Initialization and State Changes
   useEffect(() => {
@@ -274,14 +294,17 @@ export function ProfileProvider({ children }: { children: React.ReactNode }) {
       const { data: { subscription } } = supabase.auth.onAuthStateChange(
         (event, session) => {
           if (session?.user) {
+            const freshSignIn = event === "SIGNED_IN" && hasResolvedInitialSession.current;
             syncSupabaseUser(session.user);
 
-            // Fresh sign-in (Google OAuth return, magic link, in-tab sign-in):
-            // send the user straight to the channel browser/player view
-            // instead of leaving them on the Home hero landing page.
-            if (event === "SIGNED_IN" && hasResolvedInitialSession.current) {
+            // Fresh sign-in (in-tab email/password, magic link): send the user
+            // to the page their role owns — the console for an admin, the
+            // player for everyone else. A Google OAuth return is already
+            // redirected by the callback, and `redirectAfterSignIn` skips the
+            // console and any URL carrying its own destination.
+            if (freshSignIn) {
               setIsAuthModalOpen(false);
-              redirectToChannelView();
+              void redirectAfterSignIn(session.user.id);
             }
             hasResolvedInitialSession.current = true;
           } else if (event === "SIGNED_OUT") {
@@ -300,7 +323,7 @@ export function ProfileProvider({ children }: { children: React.ReactNode }) {
     // the AuthGate immediately (it will show setup instructions).
     hasResolvedInitialSession.current = true;
     setIsAuthReady(true);
-  }, [syncSupabaseUser, redirectToChannelView]);
+  }, [syncSupabaseUser, redirectAfterSignIn]);
 
   // Sign in with Google via Supabase OAuth
   const signInWithGoogle = async () => {
@@ -310,8 +333,10 @@ export function ProfileProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // Always hand the user back to the channel browsing/player view after a
-    // successful login, never to the Home hero landing page.
+    // `/watch` here is a *generic* target, not the final destination: the
+    // callback replaces it with the page the account's role owns (`/admin` for
+    // an administrator, `/watch` for everyone else). Either way the user lands
+    // in the app rather than back on the Home hero.
     const redirectUrl =
       typeof window !== "undefined"
         ? `${window.location.origin}/auth/callback?next=${encodeURIComponent("/watch")}`
