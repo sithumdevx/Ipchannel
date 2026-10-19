@@ -81,57 +81,76 @@ function registry(): StreamHealthRegistry {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Single probe against a stream URL.
+ * User-agent used when probing stream origins.
  *
- * HLS/CDN endpoints frequently reject `HEAD`, so we fall back to a 2-byte range
- * `GET` — enough to prove the origin answers with real media bytes without
- * downloading the manifest. The body is discarded immediately.
+ * Browsers are the reference client for IPTV CDNs, and many of them reject
+ * unfamiliar agents outright. The previous `StreamPulse-HealthCheck/1.0` agent
+ * was answered with 403 by a lot of origins, which marked perfectly healthy
+ * streams as dead and filtered them out of the listings. A realistic browser UA
+ * makes the sweep's verdicts match what a viewer would actually see.
  */
-async function probeOnce(url: string): Promise<StreamHealthStatus> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+const PROBE_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
+/** Single timed probe request. Returns `null` on timeout/DNS/TLS error. */
+async function probeFetch(url: string, method: "HEAD" | "GET"): Promise<Response | null> {
   try {
-    let response = await fetch(url, {
-      method: "HEAD",
-      signal: controller.signal,
+    return await fetch(url, {
+      method,
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       redirect: "follow",
-      headers: { "User-Agent": "StreamPulse-HealthCheck/1.0" },
+      headers: {
+        "User-Agent": PROBE_USER_AGENT,
+        ...(method === "GET" ? { Range: "bytes=0-1" } : {}),
+      },
       // Never let Next.js cache these probes — freshness is the whole point.
       cache: "no-store",
     });
-
-    // 405/501 = method not allowed but the stream exists. Confirm with GET.
-    if (response.status === 405 || response.status === 501) {
-      response = await fetch(url, {
-        method: "GET",
-        signal: controller.signal,
-        redirect: "follow",
-        headers: {
-          "User-Agent": "StreamPulse-HealthCheck/1.0",
-          Range: "bytes=0-1",
-        },
-        cache: "no-store",
-      });
-      // We only needed the status line; stop reading the body.
-      try {
-        await response.body?.cancel();
-      } catch {
-        /* body already consumed/closed */
-      }
-    }
-
-    if (response.ok || response.status === 206 || response.status === 304) {
-      return "live";
-    }
-    // 401/403 often mean geo/auth walls the player also can't pass — treat as dead.
-    return "dead";
   } catch {
-    // Timeout, DNS failure, TLS error, blocked origin.
-    return "dead";
-  } finally {
-    clearTimeout(timer);
+    return null; // timeout / DNS failure / TLS error / blocked origin
   }
+}
+
+/** Release a probe response body without downloading it. */
+async function drain(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+    /* body already consumed/closed */
+  }
+}
+
+/**
+ * Single probe against a stream URL.
+ *
+ * A cheap `HEAD` is tried first. A 404/410 is definitive and marks the stream
+ * dead straight away; anything else — origins that reject `HEAD` with
+ * 400/403/405/501, or transient 502/503/504 gateway errors — is confirmed with
+ * a 2-byte ranged `GET` before the stream is written off. That is what lets the
+ * 5-minute sweep mark genuinely failed endpoints (returning 502/404) as offline
+ * so `filterLive` drops them from the active listings, without false negatives
+ * from HEAD-hostile CDNs.
+ */
+async function probeOnce(url: string): Promise<StreamHealthStatus> {
+  const head = await probeFetch(url, "HEAD");
+  if (head) {
+    const alive = head.status >= 200 && head.status < 300;
+    const gone = head.status === 404 || head.status === 410;
+    await drain(head);
+    if (alive || head.status === 304) return "live";
+    if (gone) return "dead"; // definitive — a GET would not change the answer.
+  }
+
+  // Confirm with a 2-byte ranged GET (HEAD-hostile origins / transient 5xx).
+  const get = await probeFetch(url, "GET");
+  if (get) {
+    const alive = get.status >= 200 && get.status < 300;
+    const notModified = get.status === 304;
+    await drain(get);
+    if (alive || notModified) return "live";
+  }
+
+  return "dead";
 }
 
 /** Probe a URL at most once at a time; concurrent callers share the result. */
@@ -253,16 +272,21 @@ export function scheduleVerification(
  * Verify a specific subset of channels *inline*, waiting for the results.
  * Used where the caller needs the answer now (e.g. `/api/health`).
  * Returns a map of url -> status for the channels that were probed.
+ *
+ * Pass `{ force: true }` to re-probe even when a fresh verdict already exists —
+ * this is how the player reports a stream it could not play, so a genuinely
+ * dead endpoint is marked offline immediately instead of waiting for its TTL.
  */
 export async function verifyNow(
   channels: Channel[],
-  limit = PROBE_CONCURRENCY * 4
+  limit = PROBE_CONCURRENCY * 4,
+  options: { force?: boolean } = {}
 ): Promise<Map<string, StreamHealthStatus>> {
   const reg = registry();
   const results = new Map<string, StreamHealthStatus>();
 
   const stale = channels
-    .filter((c) => c.url && !getHealth(c.url))
+    .filter((c) => c.url && (options.force || !getHealth(c.url)))
     .slice(0, limit);
 
   await pooled(stale, PROBE_CONCURRENCY, async (channel) => {

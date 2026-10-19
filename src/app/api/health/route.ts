@@ -56,7 +56,9 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // On-demand probe of a single stream (used by the LIVE badge refresh).
+  // On-demand probe of a single stream. Used by the LIVE badge refresh and by
+  // the player, which reports a stream it could not play with `force=1` so a
+  // genuinely dead endpoint is marked offline without waiting for its TTL.
   const checkUrl = request.nextUrl.searchParams.get("check");
   if (checkUrl) {
     let parsed: URL;
@@ -75,9 +77,11 @@ export async function GET(request: NextRequest) {
       );
     }
 
+    const force = request.nextUrl.searchParams.get("force") === "1";
     const results = await verifyNow(
       [{ ...FALLBACK_CHANNELS[0], url: parsed.toString() }],
-      1
+      1,
+      { force }
     );
     const status = results.get(parsed.toString());
 

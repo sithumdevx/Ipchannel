@@ -12,7 +12,9 @@ import {
   Minimize,
   RotateCw,
   Tv,
-  AlertCircle,
+  WifiOff,
+  SkipForward,
+  ChevronLeft,
   Radio,
   PictureInPicture,
   Settings,
@@ -51,6 +53,9 @@ type WebkitContainer = HTMLElement & {
   webkitRequestFullscreen?: () => Promise<void> | void;
 };
 
+/** Seconds the "Stream Offline" card waits before auto-advancing. */
+const AUTO_SKIP_SECONDS = 6;
+
 export default function VideoPlayer({
   channel,
   onClose,
@@ -74,7 +79,31 @@ export default function VideoPlayer({
   const [currentQuality, setCurrentQuality] = useState<number>(-1); // -1 is Auto level switching
   const [autoResolution, setAutoResolution] = useState<string>("");
   const [showQualityMenu, setShowQualityMenu] = useState<boolean>(false);
-  const [networkRetries, setNetworkRetries] = useState<number>(0);
+  /** Seconds until the offline card auto-advances; `null` = no countdown. */
+  const [autoSkipIn, setAutoSkipIn] = useState<number | null>(null);
+
+  // Recovery counters live in refs so updating them never re-creates
+  // `loadStream` — otherwise the load effect would re-run and restart the
+  // stream in the middle of a retry.
+  const networkRetriesRef = useRef<number>(0);
+  const mediaRecoveriesRef = useRef<number>(0);
+  /** Error signatures already logged for the current stream (spam control). */
+  const loggedErrorsRef = useRef<Set<string>>(new Set());
+  /** Streams already reported to the verifier this session (dedupe). */
+  const reportedStreamsRef = useRef<Set<string>>(new Set());
+  /** True once direct playback has fallen back to the proxy. */
+  const proxyFallbackRef = useRef<boolean>(false);
+  /** Stream URL we last reset per-channel recovery state for. */
+  const lastStreamUrlRef = useRef<string | null>(null);
+
+  // Latest navigation callbacks, read through refs so `markOffline` — and
+  // therefore `loadStream` — stays referentially stable across parent renders.
+  const onNextRef = useRef(onNextChannel);
+  const onPrevRef = useRef(onPrevChannel);
+  useEffect(() => {
+    onNextRef.current = onNextChannel;
+    onPrevRef.current = onPrevChannel;
+  });
 
   // Derive target stream URL based on proxy state
   const getStreamUrl = useCallback(
@@ -87,14 +116,53 @@ export default function VideoPlayer({
     []
   );
 
+  /**
+   * Show the "Stream Offline or Unavailable" card and tell the background
+   * verifier about the failure, so a genuinely dead endpoint is marked offline
+   * and filtered out of the active listings within the next refresh.
+   */
+  const markOffline = useCallback(
+    (message: string) => {
+      setIsLoading(false);
+      setIsPlaying(false);
+      setErrorMessage(message);
+      setShowControls(true);
+      setAutoSkipIn(onNextRef.current ? AUTO_SKIP_SECONDS : null);
+
+      const url = channel.url;
+      if (url && !reportedStreamsRef.current.has(url)) {
+        reportedStreamsRef.current.add(url);
+        // Fire-and-forget: the server re-probes the origin and records the
+        // verdict, which is what drives server-side health filtering.
+        void fetch(`/api/health?check=${encodeURIComponent(url)}&force=1`, {
+          method: "GET",
+          keepalive: true,
+        }).catch(() => {
+          /* best-effort only */
+        });
+      }
+    },
+    [channel.url]
+  );
+
   // Initialize and load HLS stream with optimized buffer & auto level switching
   const loadStream = useCallback(
     (streamUrl: string, proxyState: boolean) => {
       const video = videoRef.current;
       if (!video) return;
 
+      // Reset per-stream recovery state whenever the channel changes.
+      if (lastStreamUrlRef.current !== streamUrl) {
+        lastStreamUrlRef.current = streamUrl;
+        networkRetriesRef.current = 0;
+        mediaRecoveriesRef.current = 0;
+        proxyFallbackRef.current = false;
+        loggedErrorsRef.current = new Set();
+      }
+
       setIsLoading(true);
       setErrorMessage(null);
+      setAutoSkipIn(null);
 
       // Clean up previous HLS instance
       if (hlsRef.current) {
@@ -114,9 +182,12 @@ export default function VideoPlayer({
           maxMaxBufferLength: 120,
           maxBufferHole: 0.5,
           highBufferWatchdogPeriod: 2,
-          // Timeouts & recovery
-          manifestLoadingTimeOut: 20000,
-          levelLoadingTimeOut: 20000,
+          // Timeouts & recovery. The manifest budget sits just above the
+          // proxy's 5s upstream timeout, so a slow-but-alive origin still wins
+          // while a dead one fails over to recovery (or the offline card)
+          // instead of leaving the spinner spinning.
+          manifestLoadingTimeOut: 12000,
+          levelLoadingTimeOut: 12000,
           fragLoadingTimeOut: 30000,
           // Auto bitrate / quality scaling
           startLevel: -1, // Auto level switching enabled from start
@@ -135,7 +206,9 @@ export default function VideoPlayer({
         hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
           setIsLoading(false);
           setErrorMessage(null);
-          setNetworkRetries(0);
+          setAutoSkipIn(null);
+          networkRetriesRef.current = 0;
+          mediaRecoveriesRef.current = 0;
 
           const levels = data.levels.map((lvl, index) => ({
             id: index,
@@ -156,68 +229,113 @@ export default function VideoPlayer({
           }
         });
 
-
         hls.on(Hls.Events.ERROR, (_, data) => {
-          console.warn("HLS Event Error:", data.type, data.details, data.fatal);
+          // Log each distinct failure only once per stream — a flapping origin
+          // can otherwise emit hundreds of identical errors and drown the
+          // console (the old behaviour spammed one line per failed fragment).
+          const signature = `${data.type}:${data.details}`;
+          if (!loggedErrorsRef.current.has(signature)) {
+            loggedErrorsRef.current.add(signature);
+            console.warn(
+              "[StreamPulse] HLS:",
+              data.type,
+              data.details,
+              data.fatal ? "(fatal)" : ""
+            );
+          }
 
-          if (data.fatal) {
-            switch (data.type) {
-              case Hls.ErrorTypes.NETWORK_ERROR:
-                // Auto-fallback to CORS proxy if direct failed and not already using proxy
-                if (!proxyState) {
-                  console.info("Direct playback network/CORS error. Auto-activating CORS proxy...");
-                  setUseProxy(true);
-                  loadStream(streamUrl, true);
-                  return;
-                }
+          if (!data.fatal) return;
 
-                if (networkRetries < 2) {
-                  setNetworkRetries((prev) => prev + 1);
-                  hls.startLoad();
-                } else {
-                  setIsLoading(false);
-                  setErrorMessage(
-                    "Stream network error or geo-restricted. Try another channel or reconnect."
-                  );
-                  hls.destroy();
-                }
-                break;
-              case Hls.ErrorTypes.MEDIA_ERROR:
-                console.info("Recovering from media error...");
+          const manifestFailed =
+            data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+            data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
+            data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR;
+
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              // 1) Direct playback failed (CORS, geo, dead manifest) — retry
+              //    once through the same-origin proxy. Flipping `useProxy`
+              //    re-runs the load effect for us.
+              if (!proxyState && !proxyFallbackRef.current) {
+                proxyFallbackRef.current = true;
+                console.info("[StreamPulse] Direct playback failed — retrying via proxy…");
+                setUseProxy(true);
+                return;
+              }
+
+              // 2) A couple of quick retries to ride out transient hiccups.
+              if (networkRetriesRef.current < 2) {
+                networkRetriesRef.current += 1;
+                const delay = 800 * networkRetriesRef.current;
+                window.setTimeout(() => {
+                  if (hlsRef.current === hls) {
+                    setIsLoading(true);
+                    hls.startLoad();
+                  }
+                }, delay);
+                return;
+              }
+
+              // 3) Give up — show the sleek offline state.
+              hls.destroy();
+              if (hlsRef.current === hls) hlsRef.current = null;
+              markOffline(
+                manifestFailed
+                  ? "The stream source isn't responding. It may be offline, geo-blocked, or rate-limited."
+                  : "The stream stopped sending data. Your connection may be unstable, or the source went offline."
+              );
+              return;
+
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              // Recover once with a plain media-error recovery, then with an
+              // audio-codec swap, and only then give up.
+              if (mediaRecoveriesRef.current < 1) {
+                mediaRecoveriesRef.current += 1;
                 hls.recoverMediaError();
-                break;
-              default:
-                setIsLoading(false);
-                setErrorMessage(
-                  "Unable to decode stream format. Stream might be offline."
-                );
-                hls.destroy();
-                break;
-            }
+                return;
+              }
+              if (mediaRecoveriesRef.current < 2) {
+                mediaRecoveriesRef.current += 1;
+                hls.swapAudioCodec();
+                hls.recoverMediaError();
+                return;
+              }
+              hls.destroy();
+              if (hlsRef.current === hls) hlsRef.current = null;
+              markOffline(
+                "This channel couldn't be decoded — it may be offline or use an unsupported format."
+              );
+              return;
+
+            default:
+              hls.destroy();
+              if (hlsRef.current === hls) hlsRef.current = null;
+              markOffline(
+                "This stream is unavailable or uses a format this player can't handle."
+              );
           }
         });
       } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        // Native HLS support for Safari / iOS
+        // Native HLS support for Safari / iOS — errors surface on the element.
         video.src = activeUrl;
         video.addEventListener("loadedmetadata", () => {
           setIsLoading(false);
           video.play().catch(() => setIsPlaying(false));
         });
         video.addEventListener("error", () => {
-          if (!proxyState) {
+          if (!proxyState && !proxyFallbackRef.current) {
+            proxyFallbackRef.current = true;
             setUseProxy(true);
-            loadStream(streamUrl, true);
           } else {
-            setIsLoading(false);
-            setErrorMessage("Failed to play HLS stream natively.");
+            markOffline("The stream is offline or the source is refusing the connection.");
           }
         });
       } else {
         setIsLoading(false);
-        setErrorMessage("HLS playback is not supported in this browser.");
+        setErrorMessage("HLS playback isn't supported in this browser.");
       }
     },
-    [getStreamUrl, networkRetries]
+    [getStreamUrl, markOffline]
   );
 
   // Reload when channel or proxy changes
@@ -231,6 +349,20 @@ export default function VideoPlayer({
       }
     };
   }, [channel.url, useProxy, loadStream]);
+
+  // While the offline card is showing, count down and auto-advance to the next
+  // channel. Any interaction (Retry / proxy toggle) clears `autoSkipIn` first.
+  useEffect(() => {
+    if (autoSkipIn === null) return;
+    if (autoSkipIn <= 0) {
+      onNextRef.current?.();
+      return;
+    }
+    const timer = setTimeout(() => {
+      setAutoSkipIn((prev) => (prev === null ? null : prev - 1));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [autoSkipIn]);
 
   // Handle Play/Pause
   const togglePlay = () => {
@@ -471,54 +603,108 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* Error Overlay */}
+      {/* Stream Offline / Unavailable Overlay */}
       {errorMessage && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 backdrop-blur-md z-30 p-6 text-center">
-          <div className="w-14 h-14 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center mb-4">
-            <AlertCircle className="w-8 h-8 text-rose-400" />
-          </div>
-          <h3 className="text-lg font-semibold text-white">Stream Unavailable</h3>
-          <p className="text-sm text-slate-400 max-w-md mt-1 mb-6">{errorMessage}</p>
+        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-5 bg-slate-950/92 p-6 text-center backdrop-blur-md">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_32%,rgba(244,63,94,0.16),transparent_62%)]" />
 
-          <div className="flex flex-wrap items-center justify-center gap-3">
+          <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-rose-500/20 to-amber-500/10 ring-1 ring-rose-500/30">
+            <WifiOff className="h-7 w-7 text-rose-400" />
+          </div>
+
+          <div className="relative space-y-1.5">
+            <h3 className="text-lg font-bold tracking-tight text-white sm:text-xl">
+              Stream Offline or Unavailable
+            </h3>
+            <p className="mx-auto max-w-md text-sm leading-relaxed text-slate-400">
+              {errorMessage}
+            </p>
+          </div>
+
+          <div className="relative flex flex-wrap items-center justify-center gap-2.5">
+            {onNextChannel && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAutoSkipIn(null);
+                  setErrorMessage(null);
+                  onNextChannel();
+                }}
+                className="flex items-center gap-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-600 px-5 py-2.5 text-sm font-bold text-black shadow-lg shadow-cyan-500/30 transition hover:from-cyan-300 hover:to-blue-500 active:scale-95"
+              >
+                <SkipForward className="h-4 w-4" />
+                Try Next Stream
+              </button>
+            )}
+
             <button
-              onClick={() => loadStream(channel.url, useProxy)}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-medium transition shadow-lg shadow-cyan-600/30"
+              type="button"
+              onClick={() => {
+                setAutoSkipIn(null);
+                setErrorMessage(null);
+                loadStream(channel.url, useProxy);
+              }}
+              className="flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2.5 text-sm font-semibold text-white ring-1 ring-white/15 transition hover:bg-white/20 active:scale-95"
             >
-              <RotateCw className="w-4 h-4" />
-              Retry Stream
+              <RotateCw className="h-4 w-4" />
+              Retry
             </button>
 
             <button
+              type="button"
               onClick={() => {
-                const nextProxy = !useProxy;
-                setUseProxy(nextProxy);
-                loadStream(channel.url, nextProxy);
+                setAutoSkipIn(null);
+                setErrorMessage(null);
+                setUseProxy(!useProxy);
               }}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium border border-slate-700 transition"
+              className="flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium text-slate-300 ring-1 ring-white/10 transition hover:bg-white/10 hover:text-white active:scale-95"
             >
               {useProxy ? (
                 <>
-                  <ShieldAlert className="w-4 h-4 text-amber-400" />
-                  Try Direct Connection
+                  <ShieldAlert className="h-4 w-4 text-amber-400" />
+                  Try Direct
                 </>
               ) : (
                 <>
-                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                  Try with CORS Proxy
+                  <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                  Try CORS Proxy
                 </>
               )}
             </button>
-
-            {onNextChannel && (
-              <button
-                onClick={onNextChannel}
-                className="px-4 py-2 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 text-sm font-medium border border-slate-700/60 transition"
-              >
-                Next Channel →
-              </button>
-            )}
           </div>
+
+          {autoSkipIn !== null && onNextChannel && (
+            <div className="relative flex items-center gap-3">
+              <div className="relative h-1.5 w-32 overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-blue-500 transition-[width] duration-1000 ease-linear"
+                  style={{ width: `${(autoSkipIn / AUTO_SKIP_SECONDS) * 100}%` }}
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => setAutoSkipIn(null)}
+                className="text-xs font-medium text-slate-400 underline-offset-2 hover:text-slate-200 hover:underline"
+              >
+                Auto-skip in {autoSkipIn}s — cancel
+              </button>
+            </div>
+          )}
+
+          {onPrevChannel && (
+            <button
+              type="button"
+              onClick={() => {
+                setAutoSkipIn(null);
+                setErrorMessage(null);
+                onPrevChannel();
+              }}
+              className="relative flex items-center gap-1.5 text-xs font-medium text-slate-400 transition hover:text-slate-200"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+              Previous channel
+            </button>
+          )}
         </div>
       )}
 
