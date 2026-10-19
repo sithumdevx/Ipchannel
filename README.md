@@ -34,6 +34,7 @@ verified every 5 minutes, streamed in adaptive HLS straight from your browser.**
 - [Project Structure](#-project-structure)
 - [Getting Started](#-getting-started)
 - [Environment Variables](#-environment-variables)
+- [Roles & Access Control (RBAC)](#-roles--access-control-rbac)
 - [Stream Health Checker](#-5-minute-automated-stream-health-checker)
 - [Security](#-security)
 - [Scripts](#-scripts)
@@ -48,18 +49,25 @@ StreamPulse is a cinematic IPTV aggregator built with the Next.js App Router. It
 public M3U/M3U8 playlists, indexes them into a searchable channel directory, verifies stream
 health on a five-minute cycle, and serves only **live, reachable broadcasts** behind a
 mandatory authentication wall — with cloud-synced favorites, watch history, country-wise
-filtering and a glassmorphism dark/light UI.
+filtering, a glassmorphism dark/light UI and a role-gated **admin console** for operators.
 
 | Route | Purpose |
 | :-- | :-- |
 | `/` | Cinematic landing page — hero spotlight, category rails, quick-browse grid |
 | `/watch` | Protected player view — video player, Now Playing panel, filters, infinite grid |
+| `/admin` | Role-gated console — overview metrics, streams, users, broadcast, system; dark **403** screen for anyone else |
+| `/dashboard` | Permanent redirect to `/admin` (legacy bookmarks) |
 | `/developer` | Custom developer profile — author details, tech stack, engineering highlights |
-| `/about` | Redirects to `/developer` |
+| `/categories` | Category browse — every channel group, tap through to the player |
+| `/about` · `/tv` | Redirects to `/developer` and `/watch` respectively |
+| `/auth/callback` | OAuth / email-confirmation exchange → redirects by role (`/admin` or `/watch`) |
 | `/api/channels` | Parsed, health-filtered channel catalogue with search/category/country filters |
 | `/api/proxy` | Hardened CORS-bypass proxy for M3U8 manifests |
 | `/api/health` | Stream-health sweep (cron) + on-demand probe + aggregate counters |
 | `/api/ping` | Empty, uncached latency probe that powers the connection-quality badge |
+| `/api/presence` | Active-viewer heartbeats behind the counter in the UI |
+| `/api/announcement` | Public read of the active broadcast banner |
+| `/api/admin/*` | Console APIs — `stats`, `streams`, `users`, `announcement`, `actions`; every handler gated by `requireAdmin()` |
 
 ---
 
@@ -77,14 +85,27 @@ admin console (`/admin`), **everyone else** to the player (`/watch`). The role l
 (`/auth/callback?next=/watch`) and by the profile sync layer for in-tab email/password sign-ins —
 one shared rule, so the two paths cannot disagree.
 
-### 👥 Admin Console & User Roles
-A `/admin` console (system metrics, stream health, broadcast banner, user management) gated on
-`role = 'admin'` in `public.profiles`. The check runs server-side on every request using the
-caller's own credentials, so **row-level security — not the UI — is what enforces it**, and anyone
-else gets a dark-themed **403 Access Denied** screen instead of a redirect. Administrators can
-**promote or demote** any other account from the User Management tab; role changes apply on that
-account's next page load and are written through the service role, so a client can never set its
-own role.
+### 👥 Admin Console & Role-Based Access
+A five-tab console at `/admin` — **Overview** (live metrics, traffic and sign-up chart,
+system health rate), **Streams** (per-channel health, preview modal, deep scan), **Users**
+(directory, moderation, roles), **Broadcast** (the site-wide banner) and **System** (caches,
+manual sweeps).
+
+Access is `role = 'admin'` in `public.profiles`, resolved **server-side on every request
+using the caller's own credentials** — so row-level security, not the UI, is what enforces
+it. Anyone else gets a dark-themed **403 Access Denied** screen (Google sign-in, switch
+account, operator runbook) rather than a redirect, and every `/api/admin/*` handler repeats
+the same `requireAdmin()` check, so the API is safe even if the page is bypassed.
+
+From the **Users** tab an administrator can:
+
+- **Promote** an account to `admin` or **Demote** it back to `user` — one click each, with a
+  two-step confirm. The write goes through the service role, and it applies on the account's
+  next page load (no re-login needed).
+- **Suspend** (ban + sign out everywhere) or **Restore**, and **Revoke** every session without
+  banning — the right tool for a leaked token.
+- Never act on their **own** account: the row is disabled, so a mis-click cannot lock the
+  operator out and there is always at least one administrator left.
 
 ### 🩺 5-Minute Automated Stream Health Checker
 A background verifier probes streams on a rolling 5-minute TTL (driven by an in-process
@@ -147,6 +168,7 @@ A live diagnostics card in the watch page's **Now Playing** panel, built for the
 | **Styling** | Tailwind CSS 4 (design tokens), Lucide Icons, glassmorphism UI, custom keyframe animations |
 | **Player** | HLS.js with adaptive bitrate, buffer tuning, PiP, quality switching |
 | **Backend & Auth** | Supabase — Auth (Google OAuth + email), PostgreSQL, Row Level Security |
+| **Authorization** | Role-based (`public.profiles.role`) — re-checked server-side on every page and API call, backed by forced RLS and a role-guard trigger |
 | **Streaming** | Server-side M3U parser, CORS-bypass proxy, 5-minute health verifier |
 | **Analytics** | Vercel Analytics |
 | **Deployment** | Vercel (Edge/Node functions, cron jobs, global CDN) |
@@ -161,22 +183,32 @@ ipchannel/
 │   ├── app/
 │   │   ├── page.tsx               # Cinematic landing page
 │   │   ├── watch/page.tsx         # Protected player view + filters
-│   │   ├── admin/                 # Console (metrics, streams, users, broadcast) + 403 screen
+│   │   ├── admin/                 # Console page + Users / Streams / Broadcast panels + 403 screen
 │   │   ├── developer/page.tsx     # Developer profile
-│   │   ├── api/admin/             # Console APIs (all gated on requireAdmin)
+│   │   ├── api/admin/             # stats · streams · users · announcement · actions (requireAdmin)
 │   │   ├── api/channels/          # Catalogue + search/category/country filters
 │   │   ├── api/proxy/             # CORS-bypass M3U8 proxy
 │   │   ├── api/health/            # Stream-health cron & probes
+│   │   ├── api/announcement/      # Public read of the active banner
+│   │   ├── api/presence/          # Active-viewer counter
 │   │   ├── api/ping/              # Latency probe for the diagnostics badge
 │   │   └── auth/callback/         # OAuth/email confirmation → role landing page
 │   ├── components/                # VideoPlayer, ChannelCard, CountryFilter, AuthModal …
 │   ├── context/                   # ProfileContext (favorites/history), ThemeContext
 │   ├── hooks/                     # useConnectionQuality (probe + Network Information API)
-│   ├── lib/                       # m3u-parser, stream-health, countries, admin, user-role, security/*
+│   ├── lib/
+│   │   ├── user-role.ts           # Role contract: UserRole, normalizeRole, landingPathForRole
+│   │   ├── admin.ts               # resolveAdminAccess() / requireAdmin() — session + role
+│   │   ├── admin-supabase.ts      # Service-role directory, moderation, setUserRole()
+│   │   ├── admin-stats.ts         # Aggregated console metrics
+│   │   ├── stream-health.ts       # 5-minute health verifier
+│   │   └── security/              # origin-guard, url-guard, rate-limit
 │   ├── proxy.ts                   # Edge middleware: auth gate, rate limits, headers
-│   └── types/iptv.ts              # Shared channel models
+│   └── types/                     # iptv.ts (channels), admin.ts (console shapes)
 ├── supabase/
-│   ├── migrations/                # RLS + security hardening + profiles/roles SQL
+│   ├── migrations/
+│   │   ├── 20261018120000_security_hardening.sql   # RLS, policies, least-privilege grants
+│   │   └── 20261019000000_profiles_roles.sql       # profiles.role, triggers, RLS
 │   └── audit_rls.sql              # Read-only RLS verification
 ├── SECURITY.md                    # Security audit & hardening notes
 └── vercel.json                    # 5-minute health cron
@@ -231,10 +263,17 @@ In the Supabase Dashboard → **SQL Editor**, run both migrations, then verify:
 Expected: every `public` table reports `rls_enabled = t`, `rls_forced = t`, and the audit
 prints `OK: all public tables have RLS enabled.` — details in [`SECURITY.md`](./SECURITY.md).
 
-The second migration sets up `public.profiles`, whose `role` column (`user` / `admin`) is the
-**entire** authorization model: `admin` may open `/admin`, everyone else gets the 403 screen.
-Every account defaults to `user`. Promote yourself to bootstrap the first administrator, then sign
-out and back in:
+The second migration is the RBAC one. It **adapts to the `profiles` table your project
+already has** (keyed by `id`, with `email` / `role` / `created_at`): it adds only the columns
+that are missing, rewrites any legacy `role` value to `user` unless it is exactly `admin`
+(a change that can only *narrow* access), then adds the constraints, the sign-up trigger, the
+role-guard trigger, forced RLS and the `select`-only grant. It is idempotent — re-running it is
+safe, and it never has to be run before the app works, because a missing `profiles` row simply
+reads as `user`.
+
+That `role` column (`user` / `admin`) is the **entire** authorization model: `admin` may open
+`/admin`, everyone else gets the 403 screen. Every account defaults to `user`. Promote yourself
+to bootstrap the first administrator, then sign out and back in:
 
 ```sql
 insert into public.profiles (id, role)
@@ -242,7 +281,7 @@ select id, 'admin' from auth.users where email = 'you@example.com'
 on conflict (id) do update set role = excluded.role;
 ```
 
-After that, use the console's **User Management** tab to promote or demote anyone else.
+After that, use the console's **Users** tab to promote or demote anyone else.
 
 ### 4 · Run the development server
 
@@ -301,11 +340,63 @@ Playlist → parse → schedule probe (bounded slice)
 
 ---
 
+## 🔑 Roles & Access Control (RBAC)
+
+Every account carries exactly one role, stored as `role` in `public.profiles`
+(`user` | `admin`). It is the **whole** authorization model — there is no allow-list
+env var and no client-side flag.
+
+| Role | Lands on | Console |
+| :-- | :-- | :-- |
+| `user` *(default for every new sign-up)* | `/watch` | ❌ — dark **403 Access Denied** screen |
+| `admin` | `/admin` | ✅ — full console, including the Users tab |
+
+### Where the decision is made
+
+| Point | File | Behaviour |
+| :-- | :-- | :-- |
+| Google OAuth & email confirmation | `src/app/auth/callback/route.ts` | reads the role with the freshly-established session, then redirects. `/`, `/watch` and `/auth/callback` are "generic" targets and are replaced by the role's landing page; an explicit deep link (`/watch?channel=42`) is honoured |
+| In-tab email / password sign-in | `src/context/ProfileContext.tsx` | the same rule via the shared `landingPathForRole()`, so the two paths cannot disagree. It never overrides a deep link and never loops on `/admin` |
+| Console page | `src/app/admin/page.tsx` (`src/lib/admin.ts`) | server-renders the console or the 403 screen — it never redirects, so the *reason* is always visible |
+| Console APIs | `src/lib/admin.ts` → `requireAdmin()` | validates the Supabase access token (`auth.getUser()`, verified — not merely decoded) and re-reads the role with the caller's own credentials |
+
+Everything **fails closed**: a missing row, a missing table, an unreachable project or a
+missing key all resolve to "not an administrator". A missing `profiles` row reads as
+`user`, so nothing depends on the sign-up trigger having succeeded.
+
+### The three locks on `role`
+
+1. **Least privilege** — `authenticated` holds `select` and nothing else on
+   `public.profiles`, so a member cannot promote themselves.
+2. **Row Level Security** — enabled *and forced*, with a single policy
+   (`profiles_select_own`, `id = auth.uid()`) that limits the read to the caller's own row.
+3. **A trigger** — `guard_role_change()` (a `before update` guard) rejects any `role`
+   change whose request is not the service role, so the lock still holds even if a later
+   migration widens write access.
+
+Roles are written only by the service role: the console's Promote/Demote, and the
+bootstrap statement below.
+
+### Bootstrapping the first administrator
+
+```sql
+insert into public.profiles (id, role)
+select id, 'admin' from auth.users where email = 'you@example.com'
+on conflict (id) do update set role = excluded.role;
+```
+
+Then sign out and back in (the role is re-read per request, so after that no further
+re-login is needed). Everyone else is promoted or demoted from the console's **Users** tab.
+
+---
+
 ## 🛡️ Security
 
 | Control | Implementation |
 | :-- | :-- |
 | Row Level Security | `supabase/migrations/20261018120000_security_hardening.sql` — strict `auth.uid() = user_id` policies, `anon` privileges revoked |
+| Console authorization | `supabase/migrations/20261019000000_profiles_roles.sql` — `public.profiles.role`; `requireAdmin()` re-checks it server-side on every `/admin` render and every `/api/admin/*` request |
+| Role integrity | `profiles` is RLS-enabled *and forced* with `select`-only for `authenticated`, plus a `before update` trigger (`guard_role_change`) that rejects any `role` change that is not the service role |
 | Auth gate | Edge proxy (`src/proxy.ts`) + `AuthGate` — no guest access to `/watch` |
 | Rate limiting | Per-IP, per-endpoint buckets → `429` + `Retry-After` + `X-RateLimit-*` |
 | Security headers | `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `X-Robots-Tag: noindex` |
@@ -324,6 +415,7 @@ Playlist → parse → schedule probe (bounded slice)
 | `npm run build` | Create an optimized production build |
 | `npm run start` | Serve the production build |
 | `npm run lint` | Run ESLint |
+| `npx tsc --noEmit` | Type-check the whole project without emitting |
 
 ---
 
@@ -331,9 +423,14 @@ Playlist → parse → schedule probe (bounded slice)
 
 1. Push the repository to GitHub.
 2. Import the project in **[Vercel](https://vercel.com/new)** — framework auto-detected as Next.js.
-3. Add the [required environment variables](#-environment-variables) to the project settings.
+3. Add the [required environment variables](#-environment-variables) to the project settings —
+   including the server-only `SUPABASE_SERVICE_ROLE_KEY`, which the console needs for the user
+   directory and Promote/Demote.
 4. Deploy — the 5-minute stream-health cron is already declared in `vercel.json`.
-5. Run the RLS migration once against your production Supabase project.
+5. Run **both** migrations once against your production Supabase project, in order:
+   `20261018120000_security_hardening.sql`, then `20261019000000_profiles_roles.sql`.
+6. Promote your first administrator with the bootstrap statement in
+   [Roles & Access Control](#-roles--access-control-rbac), then sign out and back in.
 
 ---
 

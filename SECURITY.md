@@ -21,7 +21,7 @@ Security is the only access control for user data.**
 | `UPDATE` policy (required for the app's `upsert()`) | ✅ — this was **missing** from the original snippet |
 | `anon` role privileges revoked on user data | ✅ in the migration |
 | Optional `profiles` table hardened if present | ✅ guarded block |
-| `public.profiles` **created** with `role` (`user`/`admin`), RLS forced, `authenticated` granted **SELECT only** | ✅ `supabase/migrations/20261019000000_profiles_roles.sql` |
+| `public.profiles.role` (`user`/`admin`) — the console's whole authorization model; adapts to the pre-existing table (`id`/`email`/`role`/`created_at`), RLS forced, `authenticated` granted **SELECT only** | ✅ `supabase/migrations/20261019000000_profiles_roles.sql` |
 | Role changes blocked at the trigger level as well as by privilege | ✅ `guard_role_change()` |
 | Every other table in `public` swept to RLS ON + FORCED | ✅ with `NOTICE` list of now-unreachable tables |
 | **Applied to your actual database** | ❌ **you must run it** |
@@ -31,10 +31,17 @@ Security is the only access control for user data.**
 1. Supabase Dashboard → **SQL Editor** → New query.
 2. Paste `supabase/migrations/20261018120000_security_hardening.sql` → **Run**.
    (Idempotent — safe to re-run.)
-3. Verify with `supabase/audit_rls.sql` (read-only). Expected output:
+3. Paste `supabase/migrations/20261019000000_profiles_roles.sql` → **Run**. It sets up the
+   RBAC `role` column and also adapts to the `profiles` table already in the project; a
+   missing row reads as `user`, so the app is never blocked by it. (Also idempotent.)
+4. Promote your first administrator — see
+   [Roles & Access Control](./README.md#-roles--access-control-rbac).
+5. Verify: run `supabase/audit_rls.sql` (read-only). Expected output:
    - every `public` table: `rls_enabled = t`, `rls_forced = t`, `policy_count ≥ 4`
    - final `DO` block prints `OK: all public tables have RLS enabled.`
-   - zero `SECURITY DEFINER` functions in `public`
+   - no `SECURITY DEFINER` functions in `public` **except** `handle_new_user()`, which is one on
+     purpose: it is the `auth.users` insert trigger that writes the `profiles` row, and it
+     swallows its own failures so bookkeeping can never block a sign-up.
 
 > I cannot execute this from the app: DDL needs the SQL editor / service role,
 > which isn't available to the codebase (and no service-role key exists in
