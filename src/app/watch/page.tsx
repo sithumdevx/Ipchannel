@@ -28,6 +28,7 @@ import {
   Tag,
 } from "lucide-react";
 import VideoPlayer from "@/components/VideoPlayer";
+import PlayerDiagnostics from "@/components/PlayerDiagnostics";
 import ChannelCard from "@/components/ChannelCard";
 import AuthGate from "@/components/AuthGate";
 import ThemeToggle from "@/components/ThemeToggle";
@@ -565,6 +566,9 @@ function WatchContent() {
                     <span className="text-xs font-bold text-ink">{rating.toFixed(1)}</span>
                   </div>
                 </div>
+
+                {/* Sri Lanka Network Friendly — live connection & stream health */}
+                <PlayerDiagnostics />
 
                 {/* Primary action: full-width favorite button, gradient border + glow */}
                 <button

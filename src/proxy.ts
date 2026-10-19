@@ -34,6 +34,17 @@ function envInt(name: string, fallback: number): number {
 }
 
 function policyFor(pathname: string): RateLimitPolicy {
+  if (pathname === "/api/ping") {
+    // Connection-quality probe. Mobile carriers across South Asia put
+    // thousands of subscribers behind a single CGNAT address, so a modest
+    // per-viewer cadence (one probe every 10s) still aggregates into a large
+    // per-IP rate. The endpoint does no work and returns an empty 204, so its
+    // ceiling is set high enough that sharing an address never produces a 429
+    // — which would be indistinguishable from a network problem and would push
+    // the diagnostics badge onto a weaker fallback signal.
+    return { limit: envInt("PING_RATE_LIMIT_PER_MIN", 1200), windowMs: 60_000 };
+  }
+
   if (pathname.startsWith("/api/proxy")) {
     // Segment passthrough is high-frequency by design (≈10-60 req/min per
     // stream), so this bucket has to stay generous.

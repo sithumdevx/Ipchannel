@@ -59,6 +59,7 @@ filtering and a glassmorphism dark/light UI.
 | `/api/channels` | Parsed, health-filtered channel catalogue with search/category/country filters |
 | `/api/proxy` | Hardened CORS-bypass proxy for M3U8 manifests |
 | `/api/health` | Stream-health sweep (cron) + on-demand probe + aggregate counters |
+| `/api/ping` | Empty, uncached latency probe that powers the connection-quality badge |
 
 ---
 
@@ -107,6 +108,23 @@ HLS.js adaptive playback (auto bitrate + quality settings), Picture-in-Picture, 
 modes, keyboard controls, chunked infinite-scroll catalogue (72 cards per chunk), cloud-synced
 favorites & watch history, and CORS-proxy failover with automatic direct-play retry.
 
+### 🇱🇰 Network-Friendly Diagnostics
+A live diagnostics card in the watch page's **Now Playing** panel, built for the unstable
+4G/LTE links this audience actually watches on:
+
+- **Connection quality** — `Excellent (Stable)` / `Good` / `Fair` / `Poor Connection` /
+  `Offline`, derived from the Network Information API *and* a real round trip to
+  `GET /api/ping`. Every signal is scored and the **worst one decides**, so the badge
+  under-promises rather than claiming a healthy link through a stall.
+- **Stream health** — `Stream Stable` / `Buffering` / `Stream Offline` (plus a neutral
+  `Paused`), read live from `hls.js` and the `<video>` element, so "your network is bad"
+  is never confused with "this channel is down".
+- **Adaptive-bitrate tuning** — lower starting bandwidth estimate, headroom-gated level
+  switching, a 30s / 30 MB buffer ceiling and extra fragment retries, so quality steps
+  down (1080p → 720p → 480p) instead of stalling when bandwidth collapses.
+- **Friendly toast** — a non-blocking notice below the header when hls.js downscales by
+  itself: *"Connection slow — adjusting playback quality for smooth streaming"*.
+
 ---
 
 ## 🧰 Tech Stack
@@ -116,7 +134,7 @@ favorites & watch history, and CORS-proxy failover with automatic direct-play re
 | **Framework** | Next.js 16 — App Router, Route Handlers, Edge Proxy, Turbopack |
 | **Language** | TypeScript (strict), React 19 |
 | **Styling** | Tailwind CSS 4 (design tokens), Lucide Icons, glassmorphism UI, custom keyframe animations |
-| **Player** | HLS.js with adaptive bitrate, PiP, quality switching |
+| **Player** | HLS.js with adaptive bitrate, buffer tuning, PiP, quality switching |
 | **Backend & Auth** | Supabase — Auth (Google OAuth + email), PostgreSQL, Row Level Security |
 | **Streaming** | Server-side M3U parser, CORS-bypass proxy, 5-minute health verifier |
 | **Analytics** | Vercel Analytics |
@@ -136,9 +154,11 @@ ipchannel/
 │   │   ├── api/channels/          # Catalogue + search/category/country filters
 │   │   ├── api/proxy/             # CORS-bypass M3U8 proxy
 │   │   ├── api/health/            # Stream-health cron & probes
+│   │   ├── api/ping/              # Latency probe for the diagnostics badge
 │   │   └── auth/callback/         # OAuth/email confirmation → /watch
 │   ├── components/                # VideoPlayer, ChannelCard, CountryFilter, AuthModal …
 │   ├── context/                   # ProfileContext (favorites/history), ThemeContext
+│   ├── hooks/                     # useConnectionQuality (probe + Network Information API)
 │   ├── lib/                       # m3u-parser, stream-health, countries, security/*
 │   ├── proxy.ts                   # Edge middleware: auth gate, rate limits, headers
 │   └── types/iptv.ts              # Shared channel models
@@ -226,6 +246,7 @@ and you will be redirected straight into the player at **`/watch`**.
 | `RATE_LIMIT_PROXY_PER_MIN` | `600` | Per-IP proxy requests / minute |
 | `RATE_LIMIT_CHANNELS_PER_MIN` | `60` | Per-IP catalogue requests / minute |
 | `RATE_LIMIT_API_PER_MIN` | `120` | Per-IP generic API requests / minute |
+| `PING_RATE_LIMIT_PER_MIN` | `1200` | Per-IP `/api/ping` latency probes / minute (generous: mobile CGNAT shares one IP) |
 
 ---
 

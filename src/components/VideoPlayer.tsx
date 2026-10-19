@@ -20,11 +20,14 @@ import {
   Settings,
   ShieldCheck,
   ShieldAlert,
+  TrendingDown,
   Zap,
 } from "lucide-react";
 import { Channel } from "@/types/iptv";
 import { countryFlag, countryLabel } from "@/lib/countries";
 import { cleanChannelTitle } from "@/lib/channel-display";
+import { publishTelemetry, resetTelemetry } from "@/lib/player-telemetry";
+import type { StreamState } from "@/types/diagnostics";
 
 interface VideoPlayerProps {
   channel: Channel;
@@ -81,6 +84,8 @@ export default function VideoPlayer({
   const [showQualityMenu, setShowQualityMenu] = useState<boolean>(false);
   /** Seconds until the offline card auto-advances; `null` = no countdown. */
   const [autoSkipIn, setAutoSkipIn] = useState<number | null>(null);
+  /** Rendering resolution after an automatic downscale; `null` = notice hidden. */
+  const [qualityNotice, setQualityNotice] = useState<string | null>(null);
 
   // Recovery counters live in refs so updating them never re-creates
   // `loadStream` — otherwise the load effect would re-run and restart the
@@ -96,6 +101,23 @@ export default function VideoPlayer({
   /** Stream URL we last reset per-channel recovery state for. */
   const lastStreamUrlRef = useRef<string | null>(null);
 
+  /**
+   * Telemetry facts that cannot be read off a DOM property, plus the level the
+   * last switch left us on. Held in a ref so the sampler below never has to be
+   * recreated — recreating it would restart the sampling interval — and never
+   * reads stale state from a render it did not see.
+   */
+  const telemetryRef = useRef({
+    stream: "idle" as StreamState,
+    resolution: null as string | null,
+    auto: true,
+    downgrades: 0,
+    lastLevelIndex: -1,
+  });
+
+  /** Auto-hide timer for the bandwidth notice. */
+  const qualityNoticeRef = useRef<NodeJS.Timeout | null>(null);
+
   // Latest navigation callbacks, read through refs so `markOffline` — and
   // therefore `loadStream` — stays referentially stable across parent renders.
   const onNextRef = useRef(onNextChannel);
@@ -104,6 +126,70 @@ export default function VideoPlayer({
     onNextRef.current = onNextChannel;
     onPrevRef.current = onPrevChannel;
   });
+
+  /**
+   * Publish a fresh diagnostics snapshot.
+   *
+   * Everything that changes continuously — buffer depth, dropped frames, the
+   * bandwidth estimate — is read from the live element here rather than being
+   * mirrored into React state, so sampling never re-renders the player itself.
+   * The store drops unchanged snapshots, and it is subscribed to by exactly one
+   * small widget, so a steady 2s tick costs essentially nothing.
+   */
+  const pushTelemetry = useCallback(() => {
+    const video = videoRef.current;
+    const hls = hlsRef.current;
+    const facts = telemetryRef.current;
+
+    // Seconds of media buffered ahead of the playhead: the range covering it,
+    // since a live stream can hold several disjoint ranges.
+    let bufferSeconds: number | null = null;
+    if (video) {
+      const ranges = video.buffered;
+      for (let i = 0; i < ranges.length; i += 1) {
+        if (
+          video.currentTime >= ranges.start(i) - 0.25 &&
+          video.currentTime <= ranges.end(i)
+        ) {
+          bufferSeconds = Math.max(0, ranges.end(i) - video.currentTime);
+          break;
+        }
+      }
+    }
+
+    // Dropped-frame share, where the browser exposes playback quality stats.
+    let droppedRatio: number | null = null;
+    const qualityStats = video?.getVideoPlaybackQuality?.();
+    if (qualityStats && qualityStats.totalVideoFrames > 0) {
+      droppedRatio = qualityStats.droppedVideoFrames / qualityStats.totalVideoFrames;
+    }
+
+    const estimate = hls?.bandwidthEstimate;
+
+    publishTelemetry({
+      stream: facts.stream,
+      resolution: facts.resolution,
+      auto: facts.auto,
+      bandwidthBps:
+        typeof estimate === "number" && estimate > 0 ? Math.round(estimate) : null,
+      bufferSeconds: bufferSeconds === null ? null : Math.round(bufferSeconds),
+      droppedRatio,
+      downgrades: facts.downgrades,
+    });
+  }, []);
+
+  /**
+   * Tell the viewer, gently, that the picture just got smaller on purpose.
+   *
+   * Only raised for automatic downscales — never when someone picked a level by
+   * hand. Repeated downscales in a cascade reuse the one notice and restart its
+   * timer, so the message tracks the final resolution instead of stacking.
+   */
+  const showQualityNotice = useCallback((resolution: string) => {
+    setQualityNotice(resolution || "lower quality");
+    if (qualityNoticeRef.current) clearTimeout(qualityNoticeRef.current);
+    qualityNoticeRef.current = setTimeout(() => setQualityNotice(null), 6000);
+  }, []);
 
   // Derive target stream URL based on proxy state
   const getStreamUrl = useCallback(
@@ -123,6 +209,12 @@ export default function VideoPlayer({
    */
   const markOffline = useCallback(
     (message: string) => {
+      telemetryRef.current.stream = "offline";
+      telemetryRef.current.auto = true;
+      pushTelemetry();
+      // A quality notice is meaningless once the stream has failed.
+      if (qualityNoticeRef.current) clearTimeout(qualityNoticeRef.current);
+      setQualityNotice(null);
       setIsLoading(false);
       setIsPlaying(false);
       setErrorMessage(message);
@@ -142,7 +234,7 @@ export default function VideoPlayer({
         });
       }
     },
-    [channel.url]
+    [channel.url, pushTelemetry]
   );
 
   // Initialize and load HLS stream with optimized buffer & auto level switching
@@ -158,7 +250,23 @@ export default function VideoPlayer({
         mediaRecoveriesRef.current = 0;
         proxyFallbackRef.current = false;
         loggedErrorsRef.current = new Set();
+        // Diagnostics are per-stream as well: a "2 step-downs" badge must never
+        // carry over from the channel the viewer just left.
+        telemetryRef.current.downgrades = 0;
+        telemetryRef.current.resolution = null;
+        telemetryRef.current.lastLevelIndex = -1;
       }
+
+      // Fresh channel or a manual reload — the widget should read "Buffering"
+      // until the element actually presents frames again.
+      telemetryRef.current.stream = "buffering";
+      // A newly constructed Hls instance always starts in auto mode, so a
+      // quality the viewer pinned on the previous stream must not survive it.
+      telemetryRef.current.auto = true;
+      setCurrentQuality(-1);
+      if (qualityNoticeRef.current) clearTimeout(qualityNoticeRef.current);
+      setQualityNotice(null);
+      pushTelemetry();
 
       setIsLoading(true);
       setErrorMessage(null);
@@ -174,26 +282,84 @@ export default function VideoPlayer({
 
       if (Hls.isSupported()) {
         const hls = new Hls({
-          // Optimized buffer settings to prevent stuttering and frequent buffering
+          // ── Execution ──────────────────────────────────────────────────────
+          // Parse and demux off the main thread. On the low-end Android
+          // handsets that dominate this audience that is the difference
+          // between a responsive UI and a frozen one.
           enableWorker: true,
+          // Low-latency HLS trades stability for a shorter delay. On a
+          // congested 4G cell that trade is the wrong way round: the viewer
+          // wants smooth, not three seconds fresher.
           lowLatencyMode: false,
+
+          // ── Adaptive bitrate ───────────────────────────────────────────────
+          // Let hls.js choose, capped to the size actually being rendered so we
+          // never pay for pixels nobody can see.
+          startLevel: -1,
+          capLevelToPlayerSize: true,
+          capLevelOnFPSDrop: true,
+          // Open streams at a realistic level. hls.js assumes 5 Mbps before its
+          // first sample, which is not a sane opening bid on a metered Sri
+          // Lankan mobile plan — but the very bottom rung is needlessly
+          // pessimistic when the link is fine.
+          abrEwmaDefaultEstimate: 800_000,
+          abrEwmaDefaultEstimateMax: 5_000_000,
+          // React to a collapse quickly, recover slowly. That asymmetry is the
+          // whole point on a link that flaps: downgrading late means a stall,
+          // climbing eagerly means oscillation. (These match the defaults; they
+          // are stated because the asymmetry is deliberate, not incidental.)
+          abrEwmaFastLive: 3,
+          abrEwmaSlowLive: 9,
+          // Require ~15% headroom before a level is used at all, and ~40%
+          // before climbing back up (library defaults: 0.95 / 0.7).
+          abrBandWidthFactor: 0.85,
+          abrBandWidthUpFactor: 0.6,
+          maxStarvationDelay: 4,
+          maxLoadingDelay: 4,
+
+          // ── Buffers ────────────────────────────────────────────────────────
+          // 30s ahead is ample for a 4G hiccup. A longer buffer does not buy
+          // resilience: hls.js fills it at a level the link cannot sustain and
+          // then stalls when it runs dry, which is exactly the buffering loop
+          // this audience reports.
+          maxBufferLength: 30,
+          // Cap the adaptive doubling at 60s. The library default of 600s is
+          // far too greedy on a metered connection.
+          maxMaxBufferLength: 60,
+          // Hard 30 MB ceiling on buffered media — mobile data is not free here.
+          maxBufferSize: 30 * 1000 * 1000,
+          // Keep 30s behind the playhead so seeking back stays instant.
           backBufferLength: 30,
-          maxBufferLength: 60,
-          maxMaxBufferLength: 120,
-          maxBufferHole: 0.5,
+          // Tolerate small timeline gaps instead of nudging/seeking, which is
+          // what produces the audible glitch on a lossy mobile link.
+          maxBufferHole: 0.3,
           highBufferWatchdogPeriod: 2,
-          // Timeouts & recovery. The manifest budget sits just above the
-          // proxy's 5s upstream timeout, so a slow-but-alive origin still wins
-          // while a dead one fails over to recovery (or the offline card)
-          // instead of leaving the spinner spinning.
+          // Fetch the first fragment while playlist levels are still parsing.
+          startFragPrefetch: true,
+          testBandwidth: true,
+
+          // ── Live latency ───────────────────────────────────────────────────
+          // Sit three target durations behind the live edge (library default),
+          // but never drift past eight before a catch-up seek — without a
+          // ceiling, playback quietly falls further behind on a weak link.
+          liveSyncDurationCount: 3,
+          liveMaxLatencyDurationCount: 8,
+
+          // ── Timeouts & retries ─────────────────────────────────────────────
+          // The manifest budget sits just above the proxy's 5s upstream
+          // timeout, so a slow-but-alive origin still wins while a dead one
+          // fails over to recovery (or the offline card) instead of leaving
+          // the spinner spinning.
           manifestLoadingTimeOut: 12000,
           levelLoadingTimeOut: 12000,
           fragLoadingTimeOut: 30000,
-          // Auto bitrate / quality scaling
-          startLevel: -1, // Auto level switching enabled from start
-          autoStartLoad: true,
-          capLevelToPlayerSize: true, // Auto cap to player dimensions to conserve bandwidth
-          abrEwmaDefaultEstimate: 1000000, // 1 Mbps default starting bandwidth estimate
+          // Extra attempts ride out a momentary 4G dropout without surfacing an
+          // error, since a handover-induced stall is normal, not exceptional.
+          manifestLoadingMaxRetry: 3,
+          levelLoadingMaxRetry: 3,
+          fragLoadingMaxRetry: 6,
+          // Allow a few nudges to resync a stalled decoder before giving up.
+          nudgeMaxRetry: 5,
         });
 
         hlsRef.current = hls;
@@ -218,15 +384,39 @@ export default function VideoPlayer({
 
           video.play().catch(() => {
             setIsPlaying(false);
+            telemetryRef.current.stream = "paused";
+            pushTelemetry();
           });
         });
 
-        // Track auto resolution switching dynamically
+        // Track level changes: the resolution on screen, whether adaptive
+        // bitrate is still in charge, and — the interesting part — any
+        // automatic step *down*, which is the moment to tell the viewer why the
+        // picture just got softer instead of letting them wonder.
         hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-          if (data.level >= 0 && hls.levels[data.level]) {
-            const lvl = hls.levels[data.level];
-            setAutoResolution(lvl.height ? `${lvl.height}p` : "");
+          if (data.level < 0 || !hls.levels[data.level]) return;
+
+          const level = hls.levels[data.level];
+          const resolution = level.height ? `${level.height}p` : "";
+          const previous = telemetryRef.current.lastLevelIndex;
+          const isAuto = hls.autoLevelEnabled;
+
+          setAutoResolution(resolution);
+
+          if (
+            isAuto &&
+            previous >= 0 &&
+            data.level < previous &&
+            (hls.levels[previous]?.bitrate ?? 0) > (level.bitrate ?? 0)
+          ) {
+            telemetryRef.current.downgrades += 1;
+            showQualityNotice(resolution);
           }
+
+          telemetryRef.current.lastLevelIndex = data.level;
+          telemetryRef.current.resolution = resolution || null;
+          telemetryRef.current.auto = isAuto;
+          pushTelemetry();
         });
 
         hls.on(Hls.Events.ERROR, (_, data) => {
@@ -331,11 +521,13 @@ export default function VideoPlayer({
           }
         });
       } else {
+        telemetryRef.current.stream = "offline";
+        pushTelemetry();
         setIsLoading(false);
         setErrorMessage("HLS playback isn't supported in this browser.");
       }
     },
-    [getStreamUrl, markOffline]
+    [getStreamUrl, markOffline, pushTelemetry, showQualityNotice]
   );
 
   // Reload when channel or proxy changes
@@ -349,6 +541,22 @@ export default function VideoPlayer({
       }
     };
   }, [channel.url, useProxy, loadStream]);
+
+  // Sample the live DOM facts — buffer depth, dropped frames, the bandwidth
+  // estimate — on a slow tick. State transitions publish immediately from their
+  // own events; this tick only keeps the continuously moving numbers honest.
+  useEffect(() => {
+    const timer = setInterval(pushTelemetry, 2000);
+    return () => clearInterval(timer);
+  }, [pushTelemetry]);
+
+  // Don't leave a snapshot (or a pending notice timer) for the next mount.
+  useEffect(() => {
+    return () => {
+      resetTelemetry();
+      if (qualityNoticeRef.current) clearTimeout(qualityNoticeRef.current);
+    };
+  }, []);
 
   // While the offline card is showing, count down and auto-advance to the next
   // channel. Any interaction (Retry / proxy toggle) clears `autoSkipIn` first.
@@ -512,11 +720,24 @@ export default function VideoPlayer({
 
   // Change HLS Quality Level: -1 enables Auto Level Switching
   const selectQuality = (levelIndex: number) => {
-    if (hlsRef.current) {
-      hlsRef.current.currentLevel = levelIndex;
-      setCurrentQuality(levelIndex);
-      setShowQualityMenu(false);
+    const hls = hlsRef.current;
+    if (!hls) return;
+
+    hls.currentLevel = levelIndex;
+    setCurrentQuality(levelIndex);
+    setShowQualityMenu(false);
+
+    // `LEVEL_SWITCHED` will confirm this a moment later, but reflect the mode
+    // immediately so the diagnostics badge never claims "Adaptive bitrate"
+    // after the viewer has pinned a level by hand.
+    telemetryRef.current.auto = levelIndex === -1;
+    if (levelIndex >= 0) {
+      const level = hls.levels[levelIndex];
+      if (level) {
+        telemetryRef.current.resolution = level.height ? `${level.height}p` : null;
+      }
     }
+    pushTelemetry();
   };
 
   // Auto-hide controls timer
@@ -574,8 +795,33 @@ export default function VideoPlayer({
           setShowControls(true);
           handleMouseMove();
         }}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
+        onPlay={() => {
+          setIsPlaying(true);
+          telemetryRef.current.stream = "playing";
+          pushTelemetry();
+        }}
+        onPlaying={() => {
+          // Fires once frames are actually being presented — the point at which
+          // "Buffering" has genuinely ended.
+          setIsPlaying(true);
+          telemetryRef.current.stream = "playing";
+          pushTelemetry();
+        }}
+        onWaiting={() => {
+          // The decoder ran out of data. This is the honest "Buffering" signal,
+          // and it arrives long before anything would surface as an error.
+          telemetryRef.current.stream = "buffering";
+          pushTelemetry();
+        }}
+        onStalled={() => {
+          telemetryRef.current.stream = "buffering";
+          pushTelemetry();
+        }}
+        onPause={() => {
+          setIsPlaying(false);
+          telemetryRef.current.stream = "paused";
+          pushTelemetry();
+        }}
         playsInline
         // iOS Safari: keep playback inside the page until the user opts into
         // fullscreen — prevents the video being pushed behind the URL bar.
@@ -600,6 +846,21 @@ export default function VideoPlayer({
               Routing manifest through CORS Proxy (Direct Segments)
             </span>
           )}
+        </div>
+      )}
+
+      {/* Adaptive-bitrate notice. Raised only for a downscale hls.js chose by
+          itself, positioned below the header overlay so it never fights the
+          controls, and click-through so it can't intercept a play/pause tap. */}
+      {qualityNotice && !errorMessage && (
+        <div className="absolute left-1/2 top-[4.25rem] z-30 w-max max-w-[88%] -translate-x-1/2 animate-fade-in pointer-events-none">
+          <div className="flex items-center gap-2 rounded-2xl border border-amber-400/40 bg-slate-950/85 px-3.5 py-2 shadow-2xl backdrop-blur-md">
+            <TrendingDown className="w-4 h-4 shrink-0 text-amber-400" />
+            <p className="text-[11px] font-semibold leading-tight text-amber-100">
+              Connection slow — adjusting playback quality for smooth streaming
+              <span className="text-amber-300/90"> · {qualityNotice}</span>
+            </p>
+          </div>
         </div>
       )}
 

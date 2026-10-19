@@ -84,7 +84,15 @@ Next.js 16 renamed `middleware.ts` → **`proxy.ts`**, so the edge gate lives in
    | --- | --- | --- |
    | `/api/proxy` | 600 / min | `RATE_LIMIT_PROXY_PER_MIN` |
    | `/api/channels` | 60 / min | `RATE_LIMIT_CHANNELS_PER_MIN` |
+   | `/api/ping` | 1200 / min | `PING_RATE_LIMIT_PER_MIN` |
    | everything else `/api/*` | 120 / min | `RATE_LIMIT_API_PER_MIN` |
+
+   `/api/ping` is deliberately generous: it is the player's latency probe
+   (`src/app/api/ping/route.ts`), and South Asian mobile carriers put thousands
+   of subscribers behind a single CGNAT address, so a modest per-viewer cadence
+   still aggregates into a high per-IP rate. The endpoint returns an empty body
+   and does no work, and a spurious `429` would be indistinguishable from a
+   network fault — it would push the diagnostics badge onto a weaker signal.
 
    Violations return `429` + `Retry-After` + `X-RateLimit-*`.
 3. `X-Robots-Tag: noindex, nofollow, noarchive` on all API responses.
@@ -149,6 +157,19 @@ Migration path to a strict nonce CSP: make the shell dynamic and follow
   - same-origin `Origin`+`Sec-Fetch-Site` → **200**
   - upstream M3U playlist through the proxy → **200** (rewritten)
   - 70 rapid `/api/channels` calls → 429 after the 60th, `Retry-After: 46`
+- Diagnostics probe (`/api/ping`, added with the network-friendly diagnostics
+  card): same-origin `GET` → `200` with `Cache-Control: no-store` and a 0-byte
+  body, `X-RateLimit-Limit: 1200`; cross-site (`Sec-Fetch-Site: cross-site`
+  with a foreign `Origin`) → **403**; five sequential probes measured 19–35 ms,
+  i.e. real round trips rather than a cached ~0 ms.
+- Regression checks around that work: `/watch` anonymous → `307 /?login=true`;
+  `/api/health` → `200` with `X-RateLimit-Limit: 120` (unchanged); `/api/proxy`
+  with no `url` → `400` (not throttled, not origin-blocked).
+- Diagnostics logic exercised straight from source with
+  `node --experimental-strip-types`: 64 assertions over `classifyConnection` /
+  `medianOf` / the formatters / the SSR guards, and 36 over the telemetry
+  store's reference-stability and change-detection contract.
+- `npx next build` → clean, with `/api/ping` reported as a static route.
 
 ## 6. Residual risks — accepted, not solved
 
@@ -186,5 +207,6 @@ Migration path to a strict nonce CSP: make the shell dynamic and follow
 | `next.config.ts` | security headers + CSP + `poweredByHeader: false` |
 | `src/app/api/proxy/route.ts` | SSRF-checked, same-origin-only, capped, timeout-bounded stream proxy |
 | `src/app/api/channels/route.ts` | clamped inputs, refresh throttle, fetch stampede collapse |
+| `src/app/api/ping/route.ts` | uncached, zero-body latency probe (CGNAT-aware rate limit) |
 | `src/app/auth/callback/route.ts` | `next` sanitization, `no-store`, hardened cookie flags |
 | `src/lib/supabase.ts` | hardened session cookie options on the browser client |
