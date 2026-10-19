@@ -96,9 +96,11 @@ function WatchContent() {
   const [showBackToTop, setShowBackToTop] = useState<boolean>(false);
 
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const channelRequestId = useRef(0);
 
   // Fetch all channels from API
   const loadAllChannels = useCallback(async (refresh = false) => {
+    const requestId = ++channelRequestId.current;
     try {
       if (refresh) setIsRefreshing(true);
       else setIsLoading(true);
@@ -108,6 +110,7 @@ function WatchContent() {
       if (!res.ok) throw new Error("Failed to load channels");
 
       const data: ChannelsApiResponse = await res.json();
+      if (requestId !== channelRequestId.current) return;
 
       if (data.channels && data.channels.length > 0) {
         setAllChannels(data.channels);
@@ -130,13 +133,16 @@ function WatchContent() {
         });
       }
     } catch (err) {
+      if (requestId !== channelRequestId.current) return;
       console.error("Error loading channels:", err);
       if (allChannels.length === 0) {
         setAllChannels(FALLBACK_CHANNELS);
       }
     } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
+      if (requestId === channelRequestId.current) {
+        setIsLoading(false);
+        setIsRefreshing(false);
+      }
     }
   }, [allChannels.length, initialChannelId, addToHistory]);
 

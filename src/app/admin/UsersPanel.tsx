@@ -152,6 +152,9 @@ export default function UsersPanel({ adminId }: { adminId: string }) {
       }
 
       setNotice({ tone: "ok", text: payload.message ?? "Done." });
+      // The action response only confirms the write. Re-read the paged
+      // directory so the role, suspension and session state shown here are
+      // authoritative after every mutation.
       load();
     } catch (err) {
       setNotice({

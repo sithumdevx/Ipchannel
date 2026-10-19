@@ -30,6 +30,7 @@ verified every 5 minutes, streamed in adaptive HLS straight from your browser.**
 
 - [Overview](#-overview)
 - [Key Features](#-key-features)
+- [Admin Console Specification](#-admin-console-specification-admin)
 - [Tech Stack](#-tech-stack)
 - [Project Structure](#-project-structure)
 - [Getting Started](#-getting-started)
@@ -39,6 +40,7 @@ verified every 5 minutes, streamed in adaptive HLS straight from your browser.**
 - [Security](#-security)
 - [Scripts](#-scripts)
 - [Deployment](#-deployment-on-vercel)
+- [Verification & Deployment](#-verification--deployment)
 - [License & Credits](#-license--credits)
 
 ---
@@ -73,6 +75,22 @@ filtering, a glassmorphism dark/light UI and a role-gated **admin console** for 
 
 ## ✨ Key Features
 
+### StreamPulse Core
+
+- **Adaptive-bitrate HLS player:** HLS.js playback with automatic quality
+  selection, direct-origin/proxy failover, Picture-in-Picture, fullscreen and
+  theater controls.
+- **Sri Lankan network-quality diagnostics:** the Now Playing diagnostics widget
+  measures `/api/ping` latency, classifies the connection for mobile 4G/LTE
+  viewers, and reports buffering and playback conditions without interrupting
+  the stream.
+- **PWA support:** install prompts, service-worker registration, offline-safe
+  shell assets and responsive layouts for desktop and mobile viewing.
+- **Resilient catalogue loading:** live M3U/M3U8 data is served through an
+  in-memory/disk/bootstrap cache chain. Category, country and search changes
+  retain skeleton states and ignore stale responses when the network reorders
+  requests.
+
 ### 🔐 Mandatory Authentication
 Secure, **account-only** access powered by Supabase Auth — **Google Sign-In** (OAuth) and
 **Email / Username registration** with email confirmation. **No guest mode:** unauthenticated
@@ -106,6 +124,17 @@ From the **Users** tab an administrator can:
   banning — the right tool for a leaked token.
 - Never act on their **own** account: the row is disabled, so a mis-click cannot lock the
   operator out and there is always at least one administrator left.
+
+### 🧭 Admin Console Specification (`/admin`)
+
+| Tab | Specification |
+| :-- | :-- |
+| **Overview** | Live channel/user/viewer counters, category/country distributions, 24-hour traffic, request success/failure and health-verdict summaries. |
+| **Streams** | Paginated live stream health table across the full cached catalogue, Online/Offline/Unverified filters, search, latency/error details and preview playback. A cold visit shows all cached channels while bounded probes seed verdicts in the background; polling replaces skeletons and updates counts as results arrive. |
+| **Quick Actions** | Run Health Check, Deep Scan, Refresh Cache, Clear Caches and Flush States. Each action is server-bounded, displays a spinner/status message, returns a refreshed snapshot and triggers client counter revalidation. |
+| **Users** | Supabase Auth directory with `admin`/`user` RBAC, Promote, Demote, Suspend, Restore and Revoke Sessions. The server-only service-role client performs privileged reads/writes and the UI refetches the current page after every mutation. |
+| **Broadcast** | Publish, replace or clear the site-wide announcement banner with level, detail, link and expiry controls. |
+| **System** | Catalogue/cache age, segment-cache hit rate, health registry state, process-scoped telemetry and explicit notes when data is thin or reset by a cold start. |
 
 ### 🩺 5-Minute Automated Stream Health Checker
 A background verifier probes streams on a rolling 5-minute TTL (driven by an in-process
@@ -304,6 +333,25 @@ a normal account is redirected into the player at **`/watch`**, while an account
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase public anon key (client-safe; RLS is the access control) |
 
+### Server-only administrator access
+
+`SUPABASE_SERVICE_ROLE_KEY` is required for the `/admin` Users tab and for
+server-side Supabase Auth directory operations. It must **never** be prefixed
+with `NEXT_PUBLIC_`, committed to the repository, or sent to the browser.
+
+For local development, add it to the untracked `.env.local` file:
+
+```bash
+SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
+```
+
+For production, add the same variable in the hosting provider's production
+environment (for Vercel: **Project Settings → Environment Variables**, scoped
+to **Production**, then redeploy). Keep Preview and Development values scoped
+separately if those environments use different Supabase projects. When it is
+absent, the rest of the console remains available and Users reports an explicit
+“directory unavailable” state instead of showing a misleading zero.
+
 ### Optional
 
 | Variable | Default | Description |
@@ -315,6 +363,49 @@ a normal account is redirected into the player at **`/watch`**, while an account
 | `RATE_LIMIT_CHANNELS_PER_MIN` | `60` | Per-IP catalogue requests / minute |
 | `RATE_LIMIT_API_PER_MIN` | `120` | Per-IP generic API requests / minute |
 | `PING_RATE_LIMIT_PER_MIN` | `1200` | Per-IP `/api/ping` latency probes / minute (generous: mobile CGNAT shares one IP) |
+
+---
+
+## ✅ Verification & Deployment
+
+Run the same checks used before a release:
+
+```bash
+npm install
+npx tsc --noEmit
+npm run lint
+npx next build
+```
+
+The production server can then be started with:
+
+```bash
+npm run start
+```
+
+Before promoting a deployment, check the public, no-store endpoints and the
+authenticated admin flow:
+
+```bash
+curl -i https://YOUR-DOMAIN/api/ping
+curl -i https://YOUR-DOMAIN/api/health
+curl -i https://YOUR-DOMAIN/api/announcement
+curl -i "https://YOUR-DOMAIN/api/channels?category=News&limit=12"
+```
+
+`/api/proxy` additionally requires a valid same-origin `url` parameter and
+rejects unsafe or cross-origin requests. `/api/admin/stats`,
+`/api/admin/streams`, `/api/admin/users` and `/api/admin/actions` must be
+checked with an authenticated administrator session; a signed-out request
+should receive `401`/`403`, not a success-shaped empty response.
+
+On Vercel, configure `STREAM_SOURCES`, both public Supabase variables,
+`SUPABASE_SERVICE_ROLE_KEY`, and `HEALTH_CRON_SECRET` in the appropriate
+environment before deploying. The cron in [`vercel.json`](./vercel.json)
+invokes `/api/health?sweep=1` every five minutes. After deployment, verify the
+first `/admin` visit shows cached streams immediately, that Online/Offline
+counts converge after the bounded health probes, and that each Quick Action
+ends with a fresh counter snapshot.
 
 ---
 

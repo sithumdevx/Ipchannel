@@ -366,6 +366,10 @@ export default function AdminConsole({ adminName, adminId }: { adminName: string
         setStats(payload.stats);
         setLastUpdated(Date.now());
         setAction({ running: null, message: payload.summary, tone: "ok" });
+        // Revalidate independently of the action response so counters reflect
+        // any deferred cache/health work that completed after the snapshot was
+        // assembled.
+        load();
       } catch (err) {
         setAction({
           running: null,
@@ -374,7 +378,7 @@ export default function AdminConsole({ adminName, adminId }: { adminName: string
         });
       }
     },
-    [action.running]
+    [action.running, load]
   );
 
   /* ---------------------------------------------------------------------- */

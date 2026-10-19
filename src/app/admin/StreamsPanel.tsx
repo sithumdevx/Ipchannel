@@ -79,7 +79,7 @@ function statusCell(row: AdminStreamRow) {
 }
 
 export default function StreamsPanel({ onStats }: { onStats: (stats: AdminStats) => void }) {
-  const [status, setStatus] = useState<StatusFilter>("offline");
+  const [status, setStatus] = useState<StatusFilter>("all");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const [data, setData] = useState<AdminStreamsResponse | null>(null);
@@ -123,6 +123,13 @@ export default function StreamsPanel({ onStats }: { onStats: (stats: AdminStats)
 
   useEffect(() => {
     load();
+  }, [load]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, 15_000);
+    return () => clearInterval(timer);
   }, [load]);
 
   // Changing filters must reset paging, or page 3 of "Offline" shows an empty
@@ -243,16 +250,26 @@ export default function StreamsPanel({ onStats }: { onStats: (stats: AdminStats)
           </div>
         ) : !data || data.rows.length === 0 ? (
           <div className="py-10 text-center">
-            <CircleCheck className="w-8 h-8 text-emerald-400/70 mx-auto" />
+            {loading ? (
+              <RefreshCw className="w-8 h-8 text-cyan-400/70 mx-auto animate-spin" />
+            ) : (
+              <CircleCheck className="w-8 h-8 text-emerald-400/70 mx-auto" />
+            )}
             <p className="mt-3 text-sm text-slate-300 font-semibold">
-              {search ? "No streams match that search." : "Nothing in this bucket."}
+              {loading
+                ? "Refreshing stream health…"
+                : search
+                  ? "No streams match that search."
+                  : "Nothing in this bucket."}
             </p>
             <p className="mt-1 text-xs text-slate-500">
-              {search
+              {loading
+                ? "Fresh verdicts will appear as probes complete."
+                : search
                 ? "Clear the search box to see every stream."
                 : status === "offline"
                   ? "No streams are currently confirmed offline."
-                  : "Run a health check to populate verdicts."}
+                  : "Health verdicts are still being populated."}
             </p>
           </div>
         ) : (

@@ -415,11 +415,14 @@ export default function LandingPage() {
    * instantly without refetching.
    */
   const inFlight = useRef<Set<string>>(new Set());
+  const requestGeneration = useRef<Map<string, number>>(new Map());
   const loadCategory = useCallback(
     async (apiCategory: string, country: string = selectedCountry) => {
       const key = catalogKey(apiCategory, country);
       if (catalog[key] || inFlight.current.has(key)) return;
       inFlight.current.add(key);
+      const generation = (requestGeneration.current.get(key) ?? 0) + 1;
+      requestGeneration.current.set(key, generation);
       try {
         const params = new URLSearchParams({ category: apiCategory, limit: "12" });
         if (country !== "All") params.set("country", country);
@@ -436,10 +439,14 @@ export default function LandingPage() {
             return merged.size > prev.length ? Array.from(merged) : prev;
           });
         }
-        setCatalog((prev) => ({ ...prev, [key]: channels }));
+        if (requestGeneration.current.get(key) === generation) {
+          setCatalog((prev) => ({ ...prev, [key]: channels }));
+        }
       } catch (err) {
         console.warn(`Could not load ${apiCategory} channels`, err);
-        setCatalog((prev) => ({ ...prev, [key]: fallbackForCountry(apiCategory, country) }));
+        if (requestGeneration.current.get(key) === generation) {
+          setCatalog((prev) => ({ ...prev, [key]: fallbackForCountry(apiCategory, country) }));
+        }
       } finally {
         inFlight.current.delete(key);
       }

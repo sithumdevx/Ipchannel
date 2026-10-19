@@ -1,7 +1,7 @@
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/admin";
 import { getChannelCatalog } from "@/lib/channels";
-import { healthRows } from "@/lib/stream-health";
+import { healthRows, runVerification } from "@/lib/stream-health";
 import type { AdminStreamsQuery, AdminStreamsResponse } from "@/types/admin";
 
 /**
@@ -45,6 +45,10 @@ export async function GET(request: NextRequest) {
     const search = (params.get("search") ?? "").slice(0, 120);
 
     const catalog = await getChannelCatalog();
+    // Return the catalogue immediately, then seed the registry so the next
+    // poll has real verdicts instead of leaving the operator on an empty
+    // offline bucket during a cold start.
+    after(() => runVerification(catalog.channels, 48));
     const table = healthRows(catalog.channels, {
       status,
       search,

@@ -472,12 +472,16 @@ function ActivityXTicks({ points }: { points: { at: number }[] }) {
 export function ActivityChart({ points }: { points: AdminActivityPoint[] }) {
   const data = points.map((point) => ({
     at: point.at,
-    requests: point.requests,
-    views: point.views,
+    requests: Math.max(0, point.requests),
+    views: Math.max(0, point.views),
   }));
+  const hasActivity = data.some((point) => point.requests > 0 || point.views > 0);
 
   return (
-    <ChartFrame points={data} empty="No activity in the last 24 hours.">
+    <ChartFrame
+      points={hasActivity ? data : []}
+      empty="Telemetry history is still thin — no traffic has been recorded yet."
+    >
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 6, right: 8, bottom: 0, left: -18 }}>
           <defs>
@@ -539,8 +543,8 @@ export function RatioChart({ points }: { points: AdminActivityPoint[] }) {
   const data = points
     .map((point) => ({
       at: point.at,
-      ok: Math.max(0, point.requests - point.failures),
-      failed: point.failures,
+      ok: Math.max(0, point.requests - Math.max(0, point.failures)),
+      failed: Math.min(Math.max(0, point.requests), Math.max(0, point.failures)),
     }))
     .filter((row) => row.ok > 0 || row.failed > 0);
 
