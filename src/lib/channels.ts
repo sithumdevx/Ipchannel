@@ -1,28 +1,27 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Channel } from "@/types/iptv";
 import { FALLBACK_CHANNELS, parseM3U } from "@/lib/m3u-parser";
 
 /**
  * Server-side channel catalogue.
  *
- * The catalogue is the *only* thing `/api/channels` depends on, and by design it
- * never blocks a request on the network:
+ * The live playlist is the primary source. The built-in catalogue is only a
+ * bootstrap floor for the very first request on a brand-new instance — it is
+ * never a cap, and the endpoint always returns every channel the active source
+ * advertises once the source is reachable.
  *
- *   1. Warm + fresh  → served straight from the in-memory catalogue.
- *   2. Warm + stale  → served immediately, refreshed in the background
- *                      (stale-while-revalidate).
- *   3. Cold          → waits at most `COLD_FETCH_BUDGET_MS` for the upstream
- *                      playlist, then answers with the built-in catalogue while
- *                      the refresh keeps running.
+ * Layers, in the order they are consulted:
  *
- * Why: serverless functions (Vercel defaults to a ~10s execution budget) are
- * routinely killed while downloading a multi-megabyte playlist. That turned into
- * a 504 for the client, which then only had a tiny placeholder list to show.
- * A bounded cold wait plus a large built-in catalogue means the API *always*
- * returns a full dataset in time, and simply upgrades to the live playlist on a
- * later request.
+ *   1. In-memory catalogue  — a warm instance answers in microseconds.
+ *   2. Disk snapshot        — survives instance recycling (see `PERSIST_FILE`),
+ *                             so a cold start still serves the full live list.
+ *   3. Upstream playlist    — fetched with a bounded wait, then written to disk.
+ *   4. Built-in catalogue   — only when all of the above are unavailable.
  *
- * State lives on `globalThis` so it survives Next.js dev-mode module reloads and
- * is shared by every route handler in a warm instance.
+ * No layer on the request path ever blocks indefinitely, so a serverless
+ * function can never be killed mid-response.
  */
 
 export type CatalogSource = "live" | "cache" | "fallback";
@@ -36,20 +35,35 @@ export interface ChannelCatalog {
   refreshing: boolean;
 }
 
-/** Matches the playlist's own slow-moving cadence (playlists change rarely). */
-const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+/**
+ * How long a fetched catalogue is considered fresh — i.e. the in-memory / edge
+ * cache window for the full live channel list.
+ */
+const CATALOG_TTL_MS = 10 * 60 * 1000;
 
 /** Longest a single request will wait on the network before answering. */
-const COLD_FETCH_BUDGET_MS = 6_000;
+const COLD_FETCH_BUDGET_MS = 8_000;
 
 /** Hard abort for the upstream download itself. */
-const UPSTREAM_FETCH_TIMEOUT_MS = 8_000;
+const UPSTREAM_FETCH_TIMEOUT_MS = 20_000;
 
 /** Stops `?refresh=true` from hammering the upstream playlist. */
 const REFRESH_MIN_INTERVAL_MS = 60_000;
 
 const UPSTREAM_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/**
+ * On-disk snapshot of the last successful fetch.
+ *
+ * Serverless instances are recycled constantly; without this, every new instance
+ * would restart from the built-in catalogue until its own download finished.
+ * Persisting the parsed list means a recycled instance can serve all live
+ * channels immediately. The path is intentionally instance-local scratch space
+ * and is treated as a best-effort cache: all I/O is guarded.
+ */
+const PERSIST_FILE = join(tmpdir(), "streampulse-channels.json");
+const PERSIST_VERSION = 2;
 
 interface CatalogState {
   channels: Channel[] | null;
@@ -62,6 +76,8 @@ interface CatalogState {
    * away instead of queueing behind the same slow download.
    */
   coldWaitSpent: boolean;
+  /** The disk snapshot has been consulted at least once for this instance. */
+  diskHydrated: boolean;
 }
 
 const GLOBAL_KEY = "__streampulseCatalog";
@@ -77,23 +93,78 @@ function catalogState(): CatalogState {
       inFlight: null,
       lastAttemptAt: 0,
       coldWaitSpent: false,
+      diskHydrated: false,
     };
   }
   return scope[GLOBAL_KEY]!;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Disk snapshot (survives instance recycling)                                 */
+/* -------------------------------------------------------------------------- */
+
+/** Load the last good catalogue from disk into memory. Never throws. */
+async function hydrateFromDisk(reg: CatalogState): Promise<void> {
+  if (reg.diskHydrated || reg.channels) return;
+  reg.diskHydrated = true;
+
+  try {
+    const raw = await readFile(PERSIST_FILE, "utf8");
+    const snapshot = JSON.parse(raw) as {
+      version?: number;
+      fetchedAt?: number;
+      channels?: Channel[];
+    };
+
+    if (snapshot?.version !== PERSIST_VERSION) return;
+    if (!Array.isArray(snapshot.channels) || snapshot.channels.length === 0) return;
+
+    // Another request may have populated memory while we were reading.
+    if (!reg.channels) {
+      reg.channels = snapshot.channels;
+      reg.fetchedAt = typeof snapshot.fetchedAt === "number" ? snapshot.fetchedAt : 0;
+    }
+  } catch {
+    // No snapshot yet, unreadable, or the host has no writable scratch space.
+  }
+}
+
+/** Persist the catalogue for the next cold start. Never throws, never blocks. */
+async function persistToDisk(channels: Channel[], fetchedAt: number): Promise<void> {
+  try {
+    await writeFile(
+      PERSIST_FILE,
+      JSON.stringify({ version: PERSIST_VERSION, fetchedAt, channels })
+    );
+  } catch {
+    // Best effort: a read-only or full filesystem must not affect serving.
+  }
+}
+
+/**
+ * Default upstream playlist.
+ *
+ * The live playlist is the *primary* source, so this is used whenever
+ * `STREAM_SOURCES` is not configured. Relying on the env var alone meant a
+ * deployment without it silently served the built-in bootstrap list instead of
+ * the 10,000+ live streams — exactly the failure this module exists to prevent.
+ */
+const DEFAULT_PLAYLIST_URL = "https://iptv-org.github.io/iptv/index.m3u";
+
 /**
  * Upstream playlist source.
  *
  * Configured via `STREAM_SOURCES` (a comma-separated list of M3U/M3U8 URLs) so
- * the catalogue stays self-branded and the source can be swapped without a code
- * change.
+ * the catalogue can be pointed at a different mirror or a private playlist; the
+ * first entry is the primary source. Unset falls back to
+ * `DEFAULT_PLAYLIST_URL`; set it to `none` to run purely on the built-in list.
  */
 function playlistUrl(): string | null {
-  const raw = process.env.STREAM_SOURCES;
-  if (!raw) return null;
+  const raw = process.env.STREAM_SOURCES?.trim();
+  if (!raw) return DEFAULT_PLAYLIST_URL;
+  if (raw.toLowerCase() === "none") return null;
   const first = raw.split(",")[0].trim();
-  return first || null;
+  return first || DEFAULT_PLAYLIST_URL;
 }
 
 /** Resolves when `promise` settles or `ms` elapses, whichever comes first. */
@@ -156,6 +227,8 @@ export function scheduleCatalogRefresh(): Promise<void> {
     return Promise.resolve();
   }
 
+  // Mark the attempt before the request starts so concurrent/throttled callers
+  // cannot queue a second download behind this one.
   reg.lastAttemptAt = Date.now();
 
   const refresh = (async () => {
@@ -164,6 +237,8 @@ export function scheduleCatalogRefresh(): Promise<void> {
       const state = catalogState();
       state.channels = channels;
       state.fetchedAt = Date.now();
+      // Snapshot for the next cold start on this host.
+      await persistToDisk(channels, state.fetchedAt);
     } catch (error) {
       // Keep serving whatever we already have; the built-in catalogue is the
       // floor so the app is never empty.
@@ -194,6 +269,9 @@ export function isCatalogStale(): boolean {
 export async function getChannelCatalog(): Promise<ChannelCatalog> {
   const reg = catalogState();
 
+  // A recycled instance may already have a full live snapshot on disk.
+  if (!reg.channels) await hydrateFromDisk(reg);
+
   if (reg.channels && !isCatalogStale()) {
     return {
       channels: reg.channels,
@@ -204,7 +282,8 @@ export async function getChannelCatalog(): Promise<ChannelCatalog> {
   }
 
   if (reg.channels) {
-    // Stale but usable: answer now, refresh behind the response.
+    // Stale but usable: answer now with the full list, refresh behind the
+    // response (stale-while-revalidate).
     void scheduleCatalogRefresh();
     return {
       channels: reg.channels,
@@ -233,12 +312,32 @@ export async function getChannelCatalog(): Promise<ChannelCatalog> {
     };
   }
 
-  // Budget exhausted (or the fetch failed): serve the built-in catalogue while
-  // the refresh continues, so the next request gets the live playlist.
+  // Upstream is unreachable *and* there is no snapshot to serve: the built-in
+  // catalogue keeps the app usable until a refresh succeeds. It is a floor, not
+  // a cap — nothing truncates a live response.
   return {
     channels: FALLBACK_CHANNELS,
     source: "fallback",
     fetchedAt: 0,
     refreshing: reg.inFlight !== null,
   };
+}
+
+/**
+ * Warm the catalogue without a request to ride on — used by the server startup
+ * hook so a freshly booted instance begins downloading the live playlist before
+ * the first visitor arrives, instead of making that visitor wait.
+ *
+ * Resolves once the in-memory catalogue is as good as it can be right now; it
+ * never rejects and never leaves the process without a usable list.
+ */
+export async function warmCatalog(): Promise<void> {
+  const reg = catalogState();
+  if (!reg.channels) await hydrateFromDisk(reg);
+
+  if (reg.channels && !isCatalogStale()) return;
+
+  // Bounded so a slow upstream cannot delay instance readiness; whatever is not
+  // finished here keeps running in the background.
+  await settledWithin(scheduleCatalogRefresh(), COLD_FETCH_BUDGET_MS);
 }

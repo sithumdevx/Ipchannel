@@ -12,7 +12,7 @@ import { ensureHealthSweeper, filterLive, runVerification } from "@/lib/stream-h
 /**
  * Execution budget for the function.
  *
- * The catalogue itself never waits more than its own cold-start budget (~6s), so
+ * The catalogue itself never waits more than its own cold-start budget (~8s), so
  * this headroom exists purely for the deferred `after()` work — refreshing the
  * playlist and probing streams — which should not be cut short mid-flight.
  * 60s is within every current Vercel plan's ceiling.
@@ -24,18 +24,20 @@ const MAX_FILTER_LENGTH = 100;
 const MAX_PAGE = 100_000;
 
 /**
- * Per-page cap for explicitly paginated requests.
+ * Sanity bound for explicitly paginated requests only.
  *
- * Omitting `limit` (or passing `all=true`) still returns the *entire* catalogue —
- * this only bounds requests that ask for a specific slice. It used to be 500,
- * which quietly truncated large playlists for clients that passed a page size.
+ * Omitting `limit` (or passing `all=true`) returns the *entire* catalogue. This
+ * exists purely so a crafted `limit` cannot ask for a nonsense slice size; it is
+ * set far above any real playlist length so it never truncates live channels.
  */
-const MAX_LIMIT = 5_000;
+const MAX_LIMIT = 100_000;
 
 /**
  * Streams a single response will queue for background health verification.
  * Small enough that the deferred probes finish inside `maxDuration` even when
- * every origin in the batch times out (48 / 16 concurrent × ~8s ≈ 24s).
+ * every origin in the batch times out (48 / 16 concurrent × 8s ≈ 24s).
+ *
+ * This only bounds *verification*, never the channel list itself.
  */
 const VERIFY_BATCH = 48;
 
@@ -90,10 +92,12 @@ export async function GET(request: NextRequest) {
   const countries = Array.from(countrySet).sort();
 
   const headers = {
-    // Hold a real catalogue at the edge for the sweep window, but let a
-    // degraded (built-in) response expire quickly so the CDN re-checks as soon
-    // as the instance has warmed its live playlist. Otherwise one cold start
-    // would pin the fallback list for every visitor for five minutes.
+    // Cache the *full* live channel list at the edge for 5 minutes (with a
+    // 10-minute stale-while-revalidate tail) so visitors get all active streams
+    // without each request touching the function or the upstream playlist.
+    // A degraded (bootstrap) response expires quickly instead, so the CDN
+    // re-checks as soon as the instance has warmed its live playlist — one cold
+    // start must never pin a short list for every visitor.
     "Cache-Control":
       catalog.source === "fallback"
         ? "public, s-maxage=30, stale-while-revalidate=120"
