@@ -1,4 +1,5 @@
 import { Channel } from "@/types/iptv";
+import { httpStatusLabel, recordHealthCheck } from "@/lib/metrics";
 
 /**
  * Stream health verifier.
@@ -27,6 +28,25 @@ export interface StreamHealthEntry {
   status: StreamHealthStatus;
   /** Epoch ms of the last completed probe. */
   checkedAt: number;
+  /** HTTP status observed on the last probe; 0 when it never got a reply. */
+  httpStatus: number;
+  /** Wall-clock duration of the last probe, in ms. */
+  latencyMs: number;
+  /** Why the stream was written off, for the diagnostics panel. */
+  error?: string;
+}
+
+/**
+ * Full result of one probe. `status` is what the app acts on; the rest exists
+ * for the admin console, which needs to distinguish "returned 502" from
+ * "never answered at all" and to report response latency per channel.
+ */
+export interface ProbeOutcome {
+  status: StreamHealthStatus;
+  /** Last HTTP status observed (0 when the origin never connected). */
+  httpStatus: number;
+  latencyMs: number;
+  error?: string;
 }
 
 /** Health records expire after 5 minutes and are re-probed on next use. */
@@ -130,39 +150,79 @@ async function drain(response: Response) {
  * 5-minute sweep mark genuinely failed endpoints (returning 502/404) as offline
  * so `filterLive` drops them from the active listings, without false negatives
  * from HEAD-hostile CDNs.
+ *
+ * Returns the full outcome — status, observed HTTP status, duration and a reason
+ * string — because the admin console needs to explain *why* a stream is offline,
+ * not merely that it is.
  */
-async function probeOnce(url: string): Promise<StreamHealthStatus> {
+async function probeOnce(url: string): Promise<ProbeOutcome> {
+  const startedAt = Date.now();
+  let lastStatus = 0;
+
   const head = await probeFetch(url, "HEAD");
   if (head) {
+    lastStatus = head.status;
     const alive = head.status >= 200 && head.status < 300;
     const gone = head.status === 404 || head.status === 410;
     await drain(head);
-    if (alive || head.status === 304) return "live";
-    if (gone) return "dead"; // definitive — a GET would not change the answer.
+    if (alive || head.status === 304) {
+      return { status: "live", httpStatus: head.status, latencyMs: Date.now() - startedAt };
+    }
+    if (gone) {
+      return {
+        status: "dead",
+        httpStatus: head.status,
+        latencyMs: Date.now() - startedAt,
+        error: `HTTP ${head.status}`,
+      };
+    }
   }
 
   // Confirm with a 2-byte ranged GET (HEAD-hostile origins / transient 5xx).
   const get = await probeFetch(url, "GET");
   if (get) {
+    lastStatus = get.status || lastStatus;
     const alive = get.status >= 200 && get.status < 300;
     const notModified = get.status === 304;
     await drain(get);
-    if (alive || notModified) return "live";
+    if (alive || notModified) {
+      return { status: "live", httpStatus: get.status, latencyMs: Date.now() - startedAt };
+    }
   }
 
-  return "dead";
+  const latencyMs = Date.now() - startedAt;
+
+  return lastStatus === 0
+    ? {
+        status: "dead",
+        httpStatus: 0,
+        latencyMs,
+        error: "No response (timeout / DNS / TLS)",
+      }
+    : {
+        status: "dead",
+        httpStatus: lastStatus,
+        latencyMs,
+        error: `HTTP ${lastStatus}`,
+      };
 }
 
 /** Probe a URL at most once at a time; concurrent callers share the result. */
-export function probeStream(url: string): Promise<StreamHealthStatus> {
+export function probeStream(
+  url: string,
+  options: { manual?: boolean } = {}
+): Promise<StreamHealthStatus> {
   const reg = registry();
   const existing = reg.inFlight.get(url);
   if (existing) return existing;
 
   const pending = probeOnce(url)
-    .then((status) => {
-      recordHealth(url, status);
-      return status;
+    .then((outcome) => {
+      recordHealth(url, outcome);
+      // Counted after the shared promise settles, so a probe that several
+      // callers awaited is still only one health check.
+      recordHealthCheck(outcome, { manual: options.manual });
+      return outcome.status;
     })
     .finally(() => {
       reg.inFlight.delete(url);
@@ -188,9 +248,32 @@ function prune(reg: StreamHealthRegistry) {
   }
 }
 
-export function recordHealth(url: string, status: StreamHealthStatus) {
+/**
+ * Store a probe verdict.
+ *
+ * Accepts either the full outcome (the normal path, from `probeStream`) or just
+ * a status, so callers that only know live/dead — the `/api/health` report path
+ * — keep working without inventing latency data they do not have.
+ */
+export function recordHealth(
+  url: string,
+  statusOrOutcome: StreamHealthStatus | ProbeOutcome,
+  checkedAt = Date.now()
+) {
   const reg = registry();
-  reg.entries.set(url, { status, checkedAt: Date.now() });
+
+  const entry: StreamHealthEntry =
+    typeof statusOrOutcome === "string"
+      ? { status: statusOrOutcome, checkedAt, httpStatus: 0, latencyMs: 0 }
+      : {
+          status: statusOrOutcome.status,
+          checkedAt,
+          httpStatus: statusOrOutcome.httpStatus,
+          latencyMs: statusOrOutcome.latencyMs,
+          error: statusOrOutcome.error,
+        };
+
+  reg.entries.set(url, entry);
   reg.watchSet.add(url);
   prune(reg);
 }
@@ -342,6 +425,62 @@ export async function verifyNow(
 }
 
 /**
+ * Inline, time-bounded sweep of a channel list.
+ *
+ * This is the dashboard's "Force System Scan". Unlike `runVerification`, which
+ * is scheduled *behind* a response and reports nothing, this waits for its
+ * results so the caller can say what was actually checked. A budget is required
+ * because no serverless function may outlive its execution ceiling: once the
+ * deadline passes, in-flight probes finish but no new ones start, and the
+ * partial result is reported honestly via `timedOut`.
+ */
+export async function scanCatalog(
+  channels: Channel[],
+  options: { limit?: number; budgetMs?: number } = {}
+): Promise<{ checked: number; dead: number; timedOut: boolean }> {
+  const reg = registry();
+  const limit = options.limit ?? PROBE_CONCURRENCY * 12;
+  const budgetMs = options.budgetMs ?? 25_000;
+  const deadline = Date.now() + budgetMs;
+
+  const targets: string[] = [];
+  const seen = new Set<string>();
+
+  for (const channel of channels) {
+    if (targets.length >= limit) break;
+    const url = channel.url;
+    // Skip anything already in flight or verified inside the TTL — a scan
+    // should advance the picture, not re-probe what we already know.
+    if (!url || seen.has(url)) continue;
+    if (reg.inFlight.has(url) || reg.pending.has(url)) continue;
+    if (getHealth(url)) continue;
+    seen.add(url);
+    targets.push(url);
+  }
+
+  let checked = 0;
+  let dead = 0;
+  let timedOut = false;
+
+  await pooled(targets, PROBE_CONCURRENCY, async (url) => {
+    if (Date.now() >= deadline) {
+      timedOut = true;
+      return;
+    }
+    // `manual: true` so the dashboard can report automated checks separately
+    // from the operator's own button presses.
+    const status = await probeStream(url, { manual: true });
+    checked++;
+    if (status === "dead") dead++;
+  });
+
+  // Anything we never got to counts as a budget overrun.
+  if (checked < targets.length) timedOut = true;
+
+  return { checked, dead, timedOut };
+}
+
+/**
  * If more than this share of *judged* streams comes back dead we assume the
  * verdicts are wrong rather than that the catalogue died.
  *
@@ -450,6 +589,50 @@ export function ensureHealthSweeper(): void {
   reg.sweeperId.unref?.();
 }
 
+/**
+ * Classify a catalogue against the health registry.
+ *
+ * Used by the admin dashboard to report "live vs offline streams" for the
+ * catalogue itself rather than for the registry (which only ever contains what
+ * has been probed). Channels that were never probed — or whose verdict expired —
+ * are reported as `unknown` rather than being silently counted as live.
+ *
+ * `trusted` mirrors the `filterLive` safety valve: when the dead ratio is
+ * implausible the verdicts are almost certainly our probes being blocked, so
+ * the dashboard surfaces that instead of presenting a false outage.
+ */
+export function categorizeHealth(channels: Channel[]): {
+  judged: number;
+  live: number;
+  dead: number;
+  unknown: number;
+  deadRatio: number;
+  trusted: boolean;
+} {
+  const reg = registry();
+  const now = Date.now();
+
+  let live = 0;
+  let dead = 0;
+  let unknown = 0;
+
+  for (const channel of channels) {
+    const entry = reg.entries.get(channel.url);
+    if (!entry || now - entry.checkedAt > HEALTH_TTL_MS) {
+      unknown++;
+      continue;
+    }
+    if (entry.status === "dead") dead++;
+    else live++;
+  }
+
+  const judged = live + dead;
+  const deadRatio = judged === 0 ? 0 : dead / judged;
+  const trusted = !(dead > 0 && judged >= MIN_JUDGED_FOR_RATIO && deadRatio > MAX_TRUSTED_DEAD_RATIO);
+
+  return { judged, live, dead, unknown, deadRatio, trusted };
+}
+
 /** Point-in-time counters for the `/api/health` status endpoint. */
 export function healthSummary() {
   const reg = registry();
@@ -469,4 +652,206 @@ export function healthSummary() {
     lastSweepAt: reg.lastSweepAt,
     ttlMs: HEALTH_TTL_MS,
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Admin diagnostics                                                           */
+/* -------------------------------------------------------------------------- */
+
+export interface StreamHealthRow {
+  id: string;
+  name: string;
+  category: string;
+  country: string;
+  url: string;
+  /** `live` = Online, `dead` = Offline, `unknown` = never probed / verdict stale. */
+  status: StreamHealthStatus | "unknown";
+  checkedAt: number;
+  latencyMs: number;
+  httpStatus: number;
+  error?: string;
+}
+
+export interface StreamHealthTable {
+  rows: StreamHealthRow[];
+  /** Rows matching the filter, before paging. */
+  total: number;
+  /** Counts across the whole catalogue, so the summary is never paging-dependent. */
+  counts: { online: number; offline: number; unknown: number };
+}
+
+/**
+ * Online/offline/unknown counts across a catalogue.
+ *
+ * Counted per unique URL: a playlist frequently lists one stream under several
+ * names, which would otherwise inflate every headline number.
+ */
+export function healthCounts(channels: Channel[]): {
+  online: number;
+  offline: number;
+  unknown: number;
+} {
+  const reg = registry();
+  const now = Date.now();
+  const seen = new Set<string>();
+  const counts = { online: 0, offline: 0, unknown: 0 };
+
+  for (const channel of channels) {
+    if (!channel.url || seen.has(channel.url)) continue;
+    seen.add(channel.url);
+
+    const entry = reg.entries.get(channel.url);
+    const fresh = entry && now - entry.checkedAt <= HEALTH_TTL_MS ? entry : null;
+
+    if (!fresh) counts.unknown++;
+    else if (fresh.status === "live") counts.online++;
+    else counts.offline++;
+  }
+
+  return counts;
+}
+
+/**
+ * The stream health monitoring table.
+ *
+ * Offline streams sort first because that is the only reason an operator opens
+ * this table: everything else is context. Counts are computed over the *whole*
+ * catalogue while `rows` is paged, so the headline numbers never change when the
+ * operator moves to page 2.
+ */
+export function healthRows(
+  channels: Channel[],
+  options: {
+    status?: "all" | "online" | "offline" | "unknown";
+    search?: string;
+    offset?: number;
+    limit?: number;
+  } = {}
+): StreamHealthTable {
+  const reg = registry();
+  const now = Date.now();
+
+  const wanted = options.status ?? "all";
+  const search = (options.search ?? "").trim().toLowerCase();
+  const offset = Math.max(0, options.offset ?? 0);
+  const limit = Math.min(200, Math.max(1, options.limit ?? 25));
+
+  const counts = { online: 0, offline: 0, unknown: 0 };
+  const matched: StreamHealthRow[] = [];
+  const countedUrls = new Set<string>();
+
+  for (const channel of channels) {
+    const entry = reg.entries.get(channel.url);
+    const fresh = entry && now - entry.checkedAt <= HEALTH_TTL_MS ? entry : null;
+    const status: StreamHealthStatus | "unknown" = fresh ? fresh.status : "unknown";
+
+    // Count unique streams: a playlist often lists one URL under several names,
+    // which would otherwise double the reported totals.
+    if (!countedUrls.has(channel.url)) {
+      countedUrls.add(channel.url);
+      if (status === "live") counts.online++;
+      else if (status === "dead") counts.offline++;
+      else counts.unknown++;
+    }
+
+    if (wanted === "online" && status !== "live") continue;
+    if (wanted === "offline" && status !== "dead") continue;
+    if (wanted === "unknown" && status !== "unknown") continue;
+
+    if (search) {
+      const haystack = `${channel.name} ${channel.category} ${channel.country} ${channel.url}`.toLowerCase();
+      if (!haystack.includes(search)) continue;
+    }
+
+    matched.push({
+      id: channel.id,
+      name: channel.name,
+      category: channel.category ?? "",
+      country: channel.country ?? "",
+      url: channel.url,
+      status,
+      checkedAt: fresh?.checkedAt ?? 0,
+      latencyMs: fresh?.latencyMs ?? 0,
+      httpStatus: fresh?.httpStatus ?? 0,
+      ...(fresh?.error ? { error: fresh.error } : {}),
+    });
+  }
+
+  const rank = (row: StreamHealthRow) =>
+    row.status === "dead" ? 0 : row.status === "live" ? 1 : 2;
+
+  matched.sort((a, b) => rank(a) - rank(b) || b.checkedAt - a.checkedAt);
+
+  return {
+    rows: matched.slice(offset, offset + limit),
+    total: matched.length,
+    counts,
+  };
+}
+
+export interface HealthErrorGroup {
+  /** Stable key: the HTTP status, or `network` when nothing answered. */
+  key: string;
+  label: string;
+  status: number;
+  count: number;
+  lastAt: number;
+  /** A few affected channels, so a failure can be inspected rather than guessed at. */
+  samples: { id: string; name: string }[];
+}
+
+/**
+ * Failing streams grouped by error type.
+ *
+ * Answers the operator's actual question — "which sources are dying, and how?"
+ * — by collapsing thousands of verdicts into a handful of buckets (502 Bad
+ * Gateway, 404 Not Found, no response) with representative channels attached.
+ */
+export function healthErrorBreakdown(channels: Channel[], limit = 12): HealthErrorGroup[] {
+  const reg = registry();
+  const groups = new Map<string, HealthErrorGroup>();
+
+  for (const channel of channels) {
+    const entry = reg.entries.get(channel.url);
+    if (!entry || entry.status !== "dead") continue;
+
+    const status = entry.httpStatus;
+    const key = status > 0 ? String(status) : "network";
+    let group = groups.get(key);
+
+    if (!group) {
+      group = {
+        key,
+        label: status > 0 ? httpStatusLabel(status) : "No response (timeout / DNS / TLS)",
+        status,
+        count: 0,
+        lastAt: 0,
+        samples: [],
+      };
+      groups.set(key, group);
+    }
+
+    group.count++;
+    if (entry.checkedAt > group.lastAt) group.lastAt = entry.checkedAt;
+    if (group.samples.length < 5) group.samples.push({ id: channel.id, name: channel.name });
+  }
+
+  return Array.from(groups.values())
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
+/**
+ * Drop every cached verdict, so the next request re-probes from scratch.
+ * The admin console's "flush stale states" action.
+ */
+export function resetHealth(): { cleared: number } {
+  const reg = registry();
+  const cleared = reg.entries.size;
+  reg.entries.clear();
+  reg.watchSet.clear();
+  reg.pending.clear();
+  reg.inFlight.clear();
+  reg.lastSweepAt = 0;
+  return { cleared };
 }

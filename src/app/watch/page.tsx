@@ -32,6 +32,8 @@ import ChannelCard from "@/components/ChannelCard";
 import AuthGate from "@/components/AuthGate";
 import ThemeToggle from "@/components/ThemeToggle";
 import CountryFilter from "@/components/CountryFilter";
+import AdminDashboardLink from "@/components/AdminDashboardLink";
+import PresenceHeartbeat from "@/components/PresenceHeartbeat";
 import { Channel, ChannelsApiResponse } from "@/types/iptv";
 import { FALLBACK_CHANNELS } from "@/lib/m3u-parser";
 import { countryFlag, countryLabel, matchesCountry } from "@/lib/countries";
@@ -309,6 +311,10 @@ function WatchContent() {
 
   return (
     <div className="min-h-screen flex flex-col bg-app text-ink">
+      {/* Reports the selected channel to the presence registry that feeds the
+          admin dashboard. Renders nothing and never affects playback. */}
+      <PresenceHeartbeat channel={selectedChannel} />
+
       {/* Top Glass Navigation Bar */}
       <header className="sticky top-0 z-40 bg-panel/85 backdrop-blur-xl border-b border-line transition">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
@@ -340,6 +346,12 @@ function WatchContent() {
               <span className="w-1.5 h-1.5 rounded-full bg-gradient-to-tr from-cyan-400 to-purple-500" />
               <span>Developer</span>
             </Link>
+
+            {/* Administrators only — the component renders nothing otherwise. */}
+            <AdminDashboardLink
+              className="hidden md:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-amber-300 bg-amber-500/10 border border-amber-500/25 hover:bg-amber-500/20 text-xs font-semibold transition"
+              label="Admin Console"
+            />
 
             <Link href="/" className="flex items-center gap-2.5">
               <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 via-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
@@ -375,6 +387,11 @@ function WatchContent() {
 
           {/* User Profile, Favorites, History & Refresh */}
           <div className="flex items-center gap-2">
+            <AdminDashboardLink
+              className="md:hidden p-2 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 transition"
+              iconClassName="w-4 h-4"
+              labelClassName="hidden"
+            />
             <ThemeToggle />
             {/* History Pill */}
             <button
@@ -774,6 +791,13 @@ function WatchContent() {
               Categories
             </Link>
             <span>•</span>
+            {/* Administrators only — renders nothing otherwise, so ordinary
+                members never see a dead link in the footer. */}
+            <AdminDashboardLink
+              className="hover:text-amber-400 transition font-semibold text-amber-300/90"
+              label="Admin Console"
+            />
+            <span className="hidden sm:inline">•</span>
             <Link
               href="/developer"
               className="hover:text-cyan-400 transition font-semibold text-ink"

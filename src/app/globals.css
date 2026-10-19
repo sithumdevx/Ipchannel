@@ -84,6 +84,21 @@ body {
   transition: background-color 0.35s ease, color 0.35s ease;
 }
 
+/**
+ * The site-wide announcement banner is the first thing in the document flow and
+ * sticky, so it pushes everything else down by its own measured height. Sticky
+ * page headers (`top: 0`) would otherwise slide *underneath* it, so while a
+ * banner is mounted they park just below it instead.
+ *
+ * `--site-banner-h` is written onto <html> by AnnouncementBanner whenever the
+ * banner is present and removed when it is dismissed or expires, which makes
+ * this rule self-cancelling — no class has to be added to every header.
+ * Specificity beats Tailwind's `.top-0`, so no `!important` is needed.
+ */
+html[site-banner="on"] .sticky.top-0:not(#site-announcement-banner) {
+  top: var(--site-banner-h, 0px);
+}
+
 /* Theme-aware custom scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

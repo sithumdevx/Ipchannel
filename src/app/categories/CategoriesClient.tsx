@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import ThemeToggle from "@/components/ThemeToggle";
+import AdminDashboardLink from "@/components/AdminDashboardLink";
 import { useProfile } from "@/context/ProfileContext";
 import { categoryTheme } from "@/lib/category-theme";
 import { FALLBACK_CHANNELS } from "@/lib/m3u-parser";
@@ -165,6 +166,11 @@ export default function CategoriesClient() {
             >
               Developer
             </Link>
+            {/* Administrators only — renders nothing for ordinary members. */}
+            <AdminDashboardLink
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-amber-300 hover:text-amber-200 hover:bg-amber-500/10 transition"
+              label="Admin"
+            />
           </nav>
 
           {/* Right actions */}
@@ -200,6 +206,12 @@ export default function CategoriesClient() {
               {item.label}
             </Link>
           ))}
+            {/* Appended outside the literal so the item can vanish entirely for
+                non-admins rather than leaving an empty pill. */}
+            <AdminDashboardLink
+              className="px-3.5 py-1.5 rounded-full text-xs font-bold whitespace-nowrap border transition bg-amber-500/10 text-amber-300 border-amber-500/30 hover:bg-amber-500/20"
+              label="Admin"
+            />
         </nav>
       </header>
 
@@ -460,6 +472,11 @@ export default function CategoriesClient() {
             <Link href="/developer" className="hover:text-cyan-400 transition">
               Developer
             </Link>
+            {/* Administrators only — renders nothing for ordinary members. */}
+            <AdminDashboardLink
+              className="hover:text-amber-400 transition font-semibold text-amber-300/90"
+              label="Admin Console"
+            />
           </div>
         </div>
       </footer>

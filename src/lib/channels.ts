@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Channel } from "@/types/iptv";
@@ -340,4 +340,57 @@ export async function warmCatalog(): Promise<void> {
   // Bounded so a slow upstream cannot delay instance readiness; whatever is not
   // finished here keeps running in the background.
   await settledWithin(scheduleCatalogRefresh(), COLD_FETCH_BUDGET_MS);
+}
+
+/** Diagnostics for the admin console. */
+export function catalogStats(): {
+  loaded: boolean;
+  channels: number;
+  fetchedAt: number;
+  ageMs: number;
+  stale: boolean;
+  refreshing: boolean;
+  ttlMs: number;
+} {
+  const reg = catalogState();
+  return {
+    loaded: reg.channels !== null,
+    channels: reg.channels?.length ?? 0,
+    fetchedAt: reg.fetchedAt,
+    ageMs: reg.fetchedAt === 0 ? 0 : Date.now() - reg.fetchedAt,
+    stale: isCatalogStale(),
+    refreshing: reg.inFlight !== null,
+    ttlMs: CATALOG_TTL_MS,
+  };
+}
+
+/**
+ * Drop the in-memory catalogue and its disk snapshot, then start a fresh
+ * download. The admin console's "refresh cache" / "clear caches" action.
+ *
+ * The caller keeps whatever it already holds, so a running app never sees an
+ * empty list: the next request either finds the new download finished or falls
+ * back to the built-in catalogue exactly as a cold start would.
+ */
+export async function clearCatalogCache(): Promise<{ dropped: number; snapshotRemoved: boolean }> {
+  const reg = catalogState();
+  const dropped = reg.channels?.length ?? 0;
+
+  reg.channels = null;
+  reg.fetchedAt = 0;
+  reg.coldWaitSpent = false;
+  reg.diskHydrated = false;
+
+  let snapshotRemoved = false;
+  try {
+    await rm(PERSIST_FILE, { force: true });
+    snapshotRemoved = true;
+  } catch {
+    // Read-only volume: nothing to remove.
+  }
+
+  // Kick off the reload immediately so nobody waits for a stale re-fetch later.
+  void scheduleCatalogRefresh();
+
+  return { dropped, snapshotRemoved };
 }

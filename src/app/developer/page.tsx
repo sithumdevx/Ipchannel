@@ -22,6 +22,7 @@ import {
   Rocket,
   LayoutGrid,
 } from "lucide-react";
+import AdminDashboardLink from "@/components/AdminDashboardLink";
 
 /* Brand marks (lucide no longer ships brand icons, so we inline them) */
 function GitHubMark({ className = "" }: { className?: string }) {
@@ -451,6 +452,11 @@ export default function DeveloperPage() {
             <Link href="/about" className="hover:text-cyan-400 transition">
               About
             </Link>
+            {/* Administrators only — renders nothing for ordinary members. */}
+            <AdminDashboardLink
+              className="hover:text-amber-400 transition font-semibold text-amber-300/90"
+              label="Admin Console"
+            />
           </div>
         </div>
       </footer>

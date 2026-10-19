@@ -7,6 +7,7 @@ import { ThemeProvider } from "@/context/ThemeContext";
 import AuthModal from "@/components/AuthModal";
 import ServiceWorkerRegister from "@/components/ServiceWorkerRegister";
 import InstallPrompt from "@/components/InstallPrompt";
+import AnnouncementBanner from "@/components/AnnouncementBanner";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -74,6 +75,7 @@ export default function RootLayout({
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
       </head>
       <body className="min-h-full flex flex-col bg-app text-ink selection:bg-cyan-500 selection:text-black">
+        <AnnouncementBanner />
         <ThemeProvider>
           <ProfileProvider>
             {children}

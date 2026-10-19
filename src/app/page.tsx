@@ -32,6 +32,7 @@ import { useProfile } from "@/context/ProfileContext";
 import { FALLBACK_CHANNELS } from "@/lib/m3u-parser";
 import { Channel, ChannelsApiResponse } from "@/types/iptv";
 import ThemeToggle from "@/components/ThemeToggle";
+import AdminDashboardLink from "@/components/AdminDashboardLink";
 import CountryFilter from "@/components/CountryFilter";
 import { countryFlag, countryLabel, matchesCountry } from "@/lib/countries";
 import { cleanChannelTitle } from "@/lib/channel-display";
@@ -605,6 +606,11 @@ export default function LandingPage() {
             >
               Developer
             </Link>
+            {/* Administrators only — renders nothing for ordinary members. */}
+            <AdminDashboardLink
+              className="px-3.5 py-2 rounded-xl text-amber-300 hover:text-amber-200 hover:bg-amber-500/10 transition"
+              label="Admin"
+            />
           </div>
 
           {/* Right actions */}
@@ -1158,6 +1164,11 @@ export default function LandingPage() {
             <Link href="/about" className="hover:text-cyan-400 transition flex items-center gap-1">
               <span>About</span>
             </Link>
+            {/* Administrators only — renders nothing for ordinary members. */}
+            <AdminDashboardLink
+              className="hover:text-amber-400 transition font-semibold text-amber-300/90"
+              label="Admin Console"
+            />
           </div>
         </div>
       </footer>

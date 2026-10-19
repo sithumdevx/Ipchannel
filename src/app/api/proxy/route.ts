@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { assertPublicHttpUrl } from "@/lib/security/url-guard";
+import { recordProxyError, recordProxySuccess, type ProxyErrorKind } from "@/lib/proxy-log";
+import { getCachedSegment, setCachedSegment } from "@/lib/segment-cache";
 
-// In-memory segment cache to prevent re-fetching chunks and improve throughput
-const segmentCache = new Map<string, { buffer: ArrayBuffer; contentType: string; cachedAt: number }>();
-const MAX_CACHE_ENTRIES = 120;
-const SEGMENT_CACHE_TTL_MS = 1000 * 60 * 5; // 5 minutes
 
 // Upstream fetch hardening.
 //
@@ -67,37 +65,26 @@ function redactUrl(rawUrl: string): string {
   }
 }
 
-function getCachedSegment(url: string) {
-  const cached = segmentCache.get(url);
-  if (!cached) return null;
-  if (Date.now() - cached.cachedAt > SEGMENT_CACHE_TTL_MS) {
-    segmentCache.delete(url);
-    return null;
-  }
-  return cached;
-}
-
-function setCachedSegment(url: string, buffer: ArrayBuffer, contentType: string) {
-  if (segmentCache.size >= MAX_CACHE_ENTRIES) {
-    const oldestKey = segmentCache.keys().next().value;
-    if (oldestKey) segmentCache.delete(oldestKey);
-  }
-  segmentCache.set(url, { buffer, contentType, cachedAt: Date.now() });
-}
-
 /**
  * Clean JSON error response.
  *
  * Never leaks upstream bodies/headers, always carries CORS + `no-store` headers,
  * and tags the result with `X-Proxy-Error` so the player (and logs) can tell a
  * proxy failure apart from a genuine 404 on a page route.
+ *
+ * Every failure is also recorded in the rolling proxy telemetry that feeds the
+ * admin dashboard's health panel — the previous `console.warn`-only logging left
+ * production failures invisible once the function logs had scrolled away.
  */
 function errorResponse(
   request: NextRequest,
   status: number,
   error: string,
-  extra: Record<string, unknown> = {}
+  extra: Record<string, unknown> = {},
+  kind: ProxyErrorKind = "internal"
 ): NextResponse {
+  recordProxyError(status, kind, error, request.nextUrl.searchParams.get("url"));
+
   return NextResponse.json(
     { error, ...extra },
     {
@@ -138,7 +125,7 @@ function upstreamErrorResponse(request: NextRequest, upstreamStatus: number): Ne
   return errorResponse(request, mapped, message, {
     upstreamStatus,
     retryable: upstreamStatus >= 500 || upstreamStatus === 429,
-  });
+  }, "upstream");
 }
 
 type UpstreamResult =
@@ -253,23 +240,23 @@ export async function GET(request: NextRequest) {
   const forceProxySegments = request.nextUrl.searchParams.get("proxySegments") === "true";
 
   if (!targetUrl) {
-    return errorResponse(request, 400, "Missing required `url` parameter.");
+    return errorResponse(request, 400, "Missing required `url` parameter.", {}, "invalid");
   }
 
   let target: URL;
   try {
     target = new URL(targetUrl);
   } catch {
-    return errorResponse(request, 400, "Invalid target URL format.");
+    return errorResponse(request, 400, "Invalid target URL format.", {}, "invalid");
   }
 
   if (target.protocol !== "http:" && target.protocol !== "https:") {
-    return errorResponse(request, 400, "Invalid protocol. Only HTTP and HTTPS are supported.");
+    return errorResponse(request, 400, "Invalid protocol. Only HTTP and HTTPS are supported.", {}, "invalid");
   }
 
   // Never proxy back into this deployment (request loops / internal probing).
   if (target.host === request.nextUrl.host) {
-    return errorResponse(request, 403, "Target not allowed.");
+    return errorResponse(request, 403, "Target not allowed.", {}, "blocked");
   }
 
   // SSRF guard: private ranges, loopback, metadata endpoints, bad ports, DNS.
@@ -279,10 +266,10 @@ export async function GET(request: NextRequest) {
   try {
     verdict = await assertPublicHttpUrl(targetUrl);
   } catch {
-    return errorResponse(request, 403, "Target not allowed.");
+    return errorResponse(request, 403, "Target not allowed.", {}, "blocked");
   }
   if (!verdict.ok) {
-    return errorResponse(request, 403, "Target not allowed.");
+    return errorResponse(request, 403, "Target not allowed.", {}, "blocked");
   }
 
   const isSegment = SEGMENT_EXTENSION_RE.test(target.pathname);
@@ -291,6 +278,7 @@ export async function GET(request: NextRequest) {
   if (isSegment) {
     const cached = getCachedSegment(targetUrl);
     if (cached) {
+      recordProxySuccess();
       return new NextResponse(cached.buffer, {
         status: 200,
         headers: {
@@ -312,11 +300,11 @@ export async function GET(request: NextRequest) {
 
     if (upstream.kind === "timeout") {
       console.warn("Proxy upstream timeout:", redactUrl(targetUrl));
-      return errorResponse(request, 504, "Stream source timed out.", { retryable: true });
+      return errorResponse(request, 504, "Stream source timed out.", { retryable: true }, "upstream");
     }
     if (upstream.kind === "network") {
       console.warn("Proxy upstream unreachable:", redactUrl(targetUrl));
-      return errorResponse(request, 502, "Stream source is unreachable.", { retryable: true });
+      return errorResponse(request, 502, "Stream source is unreachable.", { retryable: true }, "upstream");
     }
     if (upstream.kind === "status") {
       console.warn("Proxy upstream status:", redactUrl(targetUrl), upstream.status);
@@ -339,7 +327,7 @@ export async function GET(request: NextRequest) {
     if (isM3U8) {
       const raw = await upstreamResponse.arrayBuffer();
       if (raw.byteLength > MAX_PLAYLIST_BYTES) {
-        return errorResponse(request, 413, "Playlist too large.");
+        return errorResponse(request, 413, "Playlist too large.", {}, "limit");
       }
 
       const text = new TextDecoder().decode(raw);
@@ -351,7 +339,7 @@ export async function GET(request: NextRequest) {
         console.warn("Proxy invalid manifest:", redactUrl(targetUrl));
         return errorResponse(request, 502, "Stream returned an invalid HLS manifest.", {
           retryable: true,
-        });
+        }, "manifest");
       }
 
       const currentOrigin = request.nextUrl.origin;
@@ -399,6 +387,7 @@ export async function GET(request: NextRequest) {
         return absoluteUrl;
       });
 
+      recordProxySuccess();
       return new NextResponse(rewrittenLines.join("\n"), {
         status: 200,
         headers: {
@@ -414,12 +403,12 @@ export async function GET(request: NextRequest) {
     // Media segment fetched through the proxy: cap, cache and stream back.    //
     // --------------------------------------------------------------------- //
     if (declaredLength > MAX_SEGMENT_BYTES) {
-      return errorResponse(request, 413, "Segment too large.");
+      return errorResponse(request, 413, "Segment too large.", {}, "limit");
     }
 
     const buffer = await upstreamResponse.arrayBuffer();
     if (buffer.byteLength > MAX_SEGMENT_BYTES) {
-      return errorResponse(request, 413, "Segment too large.");
+      return errorResponse(request, 413, "Segment too large.", {}, "limit");
     }
 
     const finalContentType =
@@ -445,6 +434,7 @@ export async function GET(request: NextRequest) {
     headers.set("X-Content-Type-Options", "nosniff");
     headers.set("X-Proxy-Cache", "MISS");
 
+    recordProxySuccess();
     return new NextResponse(buffer, { status: 200, headers });
   } catch (error) {
     // Log the endpoint only — never the full (possibly signed) source URL, and
