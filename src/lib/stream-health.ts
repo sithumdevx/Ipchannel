@@ -269,6 +269,40 @@ export function scheduleVerification(
 }
 
 /**
+ * Awaitable variant of `scheduleVerification`, for callers that run *after* the
+ * response has been flushed (e.g. `after()` in a route handler).
+ *
+ * `scheduleVerification` deliberately drops its handle on the probes, which is
+ * fine on a long-lived server but lets a serverless platform freeze the function
+ * mid-probe. Keeping the handle here lets the platform wait for the results, so
+ * the health registry is actually populated by the time the next request lands.
+ */
+export async function runVerification(
+  channels: Channel[],
+  limit = PROBE_BATCH_LIMIT
+): Promise<number> {
+  const reg = registry();
+  const targets: string[] = [];
+  const seen = new Set<string>();
+
+  for (const channel of channels) {
+    if (targets.length >= limit) break;
+    const url = channel.url;
+    if (!url || seen.has(url)) continue;
+    if (reg.inFlight.has(url) || reg.pending.has(url)) continue;
+    if (getHealth(url)) continue; // still fresh
+    seen.add(url);
+    targets.push(url);
+  }
+
+  await pooled(targets, PROBE_CONCURRENCY, async (url) => {
+    await probeStream(url);
+  });
+
+  return targets.length;
+}
+
+/**
  * Verify a specific subset of channels *inline*, waiting for the results.
  * Used where the caller needs the answer now (e.g. `/api/health`).
  * Returns a map of url -> status for the channels that were probed.
@@ -308,20 +342,58 @@ export async function verifyNow(
 }
 
 /**
+ * If more than this share of *judged* streams comes back dead we assume the
+ * verdicts are wrong rather than that the catalogue died.
+ *
+ * Serverless egress (Vercel, etc.) is frequently blocked by whole CDN fleets at
+ * once — a datacenter IP range gets 403/502 everywhere and the sweep would mark
+ * the entire catalogue offline, leaving the app showing a handful of channels.
+ * A real playlist never loses most of its streams inside one 5-minute window, so
+ * an anomalous ratio means "our probe was blocked", and we keep the list intact.
+ */
+const MAX_TRUSTED_DEAD_RATIO = 0.6;
+
+/** Below this many judged channels the ratio is too small to be meaningful. */
+const MIN_JUDGED_FOR_RATIO = 12;
+
+/**
  * Drop channels confirmed dead within the TTL and stamp `isLive` on the rest.
  * Unknown channels are kept (see `isChannelLive`).
+ *
+ * Filtering is deliberately conservative: it is a presentation nicety, never a
+ * prerequisite for serving the catalogue, so it must never be able to blank the
+ * listings when the verifier itself is the thing that is broken.
  */
 export function filterLive(channels: Channel[]): Channel[] {
   const reg = registry();
   if (reg.entries.size === 0) return channels;
 
-  const out: Channel[] = [];
+  const now = Date.now();
+  const deadUrls = new Set<string>();
+  let judged = 0;
+
   for (const channel of channels) {
-    const entry = getHealth(channel.url);
-    if (entry && entry.status === "dead") continue;
-    out.push({ ...channel, isLive: entry ? entry.status === "live" : true });
+    const entry = reg.entries.get(channel.url);
+    if (!entry || now - entry.checkedAt > HEALTH_TTL_MS) continue; // unknown
+    judged++;
+    if (entry.status === "dead") deadUrls.add(channel.url);
   }
-  return out;
+
+  if (judged === 0) return channels;
+
+  // Safety valve: an implausibly high dead ratio means our probes (not the
+  // streams) are failing. Keep everything visible and let the next sweep retry.
+  if (deadUrls.size > 0 && judged >= MIN_JUDGED_FOR_RATIO && deadUrls.size / judged > MAX_TRUSTED_DEAD_RATIO) {
+    return channels.map((channel) => ({ ...channel, isLive: true }));
+  }
+
+  if (deadUrls.size === 0) {
+    return channels.map((channel) => ({ ...channel, isLive: true }));
+  }
+
+  return channels
+    .filter((channel) => !deadUrls.has(channel.url))
+    .map((channel) => ({ ...channel, isLive: true }));
 }
 
 /* -------------------------------------------------------------------------- */

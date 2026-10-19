@@ -1,98 +1,49 @@
-import { NextRequest, NextResponse } from "next/server";
-import { fetchAndParseM3U, FALLBACK_CHANNELS } from "@/lib/m3u-parser";
-import { Channel, ChannelsApiResponse } from "@/types/iptv";
+import { after, NextRequest, NextResponse } from "next/server";
+import type { ChannelsApiResponse } from "@/types/iptv";
 import { matchesCountry } from "@/lib/countries";
 import { cleanChannelTitle } from "@/lib/channel-display";
 import {
-  ensureHealthSweeper,
-  filterLive,
-  scheduleVerification,
-} from "@/lib/stream-health";
+  getChannelCatalog,
+  isCatalogStale,
+  scheduleCatalogRefresh,
+} from "@/lib/channels";
+import { ensureHealthSweeper, filterLive, runVerification } from "@/lib/stream-health";
 
-// Global in-memory cache for ultra-fast serving of all parsed channels
-let cachedChannels: Channel[] | null = null;
-let lastCacheTime = 0;
-const CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
-
-// Abuse controls for the upstream playlist fetch:
-//  - REFRESH_MIN_INTERVAL_MS stops `?refresh=true` from hammering the upstream
-//    playlist on every request
-//  - refreshInFlight collapses concurrent refreshes into one upstream request
-const REFRESH_MIN_INTERVAL_MS = 60_000;
-let refreshInFlight: Promise<void> | null = null;
+/**
+ * Execution budget for the function.
+ *
+ * The catalogue itself never waits more than its own cold-start budget (~6s), so
+ * this headroom exists purely for the deferred `after()` work — refreshing the
+ * playlist and probing streams — which should not be cut short mid-flight.
+ * 60s is within every current Vercel plan's ceiling.
+ */
+export const maxDuration = 60;
 
 // Input caps so a crafted query string cannot turn into a huge scan/allocation
 const MAX_FILTER_LENGTH = 100;
 const MAX_PAGE = 100_000;
-const MAX_LIMIT = 500;
 
 /**
- * Upstream playlist source.
+ * Per-page cap for explicitly paginated requests.
  *
- * Configured via the `STREAM_SOURCES` environment variable (a comma-separated
- * list of M3U/M3U8 URLs) so the catalogue stays fully self-branded and the
- * source can be swapped without a code change. Falls back to the built-in
- * verified channel set when unset.
+ * Omitting `limit` (or passing `all=true`) still returns the *entire* catalogue —
+ * this only bounds requests that ask for a specific slice. It used to be 500,
+ * which quietly truncated large playlists for clients that passed a page size.
  */
-function playlistUrl(): string | null {
-  const raw = process.env.STREAM_SOURCES;
-  if (!raw) return null;
-  const first = raw.split(",")[0]?.trim();
-  return first ? first : null;
-}
+const MAX_LIMIT = 5_000;
+
+/**
+ * Streams a single response will queue for background health verification.
+ * Small enough that the deferred probes finish inside `maxDuration` even when
+ * every origin in the batch times out (48 / 16 concurrent × ~8s ≈ 24s).
+ */
+const VERIFY_BATCH = 48;
 
 function clampParam(value: string | null): string | null {
   if (!value) return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
   return trimmed.slice(0, MAX_FILTER_LENGTH);
-}
-
-async function loadChannels(forceRefresh: boolean): Promise<"live" | "cache" | "fallback"> {
-  const now = Date.now();
-  const stale = !cachedChannels || now - lastCacheTime > CACHE_TTL_MS;
-  const wantRefresh = forceRefresh && now - lastCacheTime >= REFRESH_MIN_INTERVAL_MS;
-
-  if (!stale && !wantRefresh) return "cache";
-
-  // Collapse stampedes: concurrent callers join the in-flight fetch instead of
-  // each opening their own upstream connection.
-  if (refreshInFlight) {
-    await refreshInFlight;
-    return cachedChannels ? "cache" : "fallback";
-  }
-
-  const requestedRefresh = wantRefresh;
-  let fetchedFresh = false;
-
-  refreshInFlight = (async () => {
-    try {
-      const source = playlistUrl();
-      if (!source) {
-        cachedChannels = cachedChannels || FALLBACK_CHANNELS;
-        return;
-      }
-      const channels = await fetchAndParseM3U(source);
-      if (channels && channels.length > 0) {
-        cachedChannels = channels;
-        lastCacheTime = Date.now();
-        fetchedFresh = true;
-      } else {
-        cachedChannels = cachedChannels || FALLBACK_CHANNELS;
-      }
-    } catch {
-      cachedChannels = cachedChannels || FALLBACK_CHANNELS;
-    } finally {
-      refreshInFlight = null;
-    }
-  })();
-
-  await refreshInFlight;
-
-  if (!cachedChannels) return "fallback";
-  if (fetchedFresh && requestedRefresh) return "live";
-  if (cachedChannels === FALLBACK_CHANNELS) return "fallback";
-  return "cache";
 }
 
 export async function GET(request: NextRequest) {
@@ -104,9 +55,7 @@ export async function GET(request: NextRequest) {
   const forceRefresh = searchParams.get("refresh") === "true";
 
   const rawPage = Number.parseInt(searchParams.get("page") || "1", 10);
-  const pageParam = Number.isFinite(rawPage)
-    ? Math.min(Math.max(rawPage, 1), MAX_PAGE)
-    : 1;
+  const pageParam = Number.isFinite(rawPage) ? Math.min(Math.max(rawPage, 1), MAX_PAGE) : 1;
 
   const rawLimit = searchParams.get("limit")
     ? Number.parseInt(searchParams.get("limit")!, 10)
@@ -115,14 +64,19 @@ export async function GET(request: NextRequest) {
     ? Math.min(Math.max(rawLimit, 0), MAX_LIMIT)
     : 0;
 
-  const source = await loadChannels(forceRefresh);
+  // Bounded: returns the live playlist, a warm cache, or the built-in catalogue —
+  // never an empty list and never a serverless timeout.
+  const catalog = await getChannelCatalog();
+  const allChannels = catalog.channels;
+
+  // `?refresh=true` asks for a fresh download; the catalogue's own throttle stops
+  // that from becoming an upstream hammer, and it never blocks this response.
+  if (forceRefresh) void scheduleCatalogRefresh();
 
   // Keep the 5-minute background verifier running on long-lived servers.
   ensureHealthSweeper();
 
-  const allChannels = cachedChannels || FALLBACK_CHANNELS;
-
-  // Extract unique categories and countries across the entire parsed list
+  // Extract unique categories and countries across the entire catalogue
   const categorySet = new Set<string>();
   const countrySet = new Set<string>();
 
@@ -135,27 +89,41 @@ export async function GET(request: NextRequest) {
   const categories = Array.from(categorySet).sort();
   const countries = Array.from(countrySet).sort();
 
-  // If client wants all channels (for client-side virtualization and instant search)
+  const headers = {
+    // Hold a real catalogue at the edge for the sweep window, but let a
+    // degraded (built-in) response expire quickly so the CDN re-checks as soon
+    // as the instance has warmed its live playlist. Otherwise one cold start
+    // would pin the fallback list for every visitor for five minutes.
+    "Cache-Control":
+      catalog.source === "fallback"
+        ? "public, s-maxage=30, stale-while-revalidate=120"
+        : "public, s-maxage=300, stale-while-revalidate=600",
+  };
+
+  // Deferred work: everything that must not delay (or break) the response.
+  // `after()` keeps the platform from freezing the function while it runs.
+  const deferWork = (toVerify: typeof allChannels) => {
+    after(async () => {
+      if (isCatalogStale()) await scheduleCatalogRefresh();
+      await runVerification(toVerify, VERIFY_BATCH);
+    });
+  };
+
   if (returnAll) {
-    // Hide confirmed-dead streams and kick off background verification for a
-    // bounded slice, so health converges over successive 5-minute windows
-    // without this request ever blocking on network probes.
+    // Hide confirmed-dead streams; health converges over successive 5-minute
+    // windows without this request ever blocking on network probes.
     const live = filterLive(allChannels);
-    scheduleVerification(live.slice(0, 400));
+    deferWork(live);
 
     const response: ChannelsApiResponse = {
       channels: live,
       total: live.length,
       categories,
       countries,
-      source,
+      source: catalog.source,
     };
 
-    return NextResponse.json(response, {
-      headers: {
-        "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600",
-      },
-    });
+    return NextResponse.json(response, { headers });
   }
 
   // Otherwise apply server-side filters if query params were passed
@@ -183,8 +151,7 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  // Drop confirmed-dead streams *before* pagination so pages stay dense, then
-  // schedule verification for what we're about to serve.
+  // Drop confirmed-dead streams *before* pagination so pages stay dense.
   filtered = filterLive(filtered);
 
   const total = filtered.length;
@@ -197,19 +164,15 @@ export async function GET(request: NextRequest) {
     paginatedChannels = filtered.slice(startIndex, startIndex + limitParam);
   }
 
-  scheduleVerification(paginatedChannels);
+  deferWork(paginatedChannels);
 
   const response: ChannelsApiResponse = {
     channels: paginatedChannels,
     total,
     categories,
     countries,
-    source,
+    source: catalog.source,
   };
 
-  return NextResponse.json(response, {
-    headers: {
-      "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600",
-    },
-  });
+  return NextResponse.json(response, { headers });
 }
