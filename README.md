@@ -510,20 +510,6 @@ re-login is needed). Everyone else is promoted or demoted from the console's **U
 
 ---
 
-## ☁️ Deployment on Vercel
-
-1. Push the repository to GitHub.
-2. Import the project in **[Vercel](https://vercel.com/new)** — framework auto-detected as Next.js.
-3. Add the [required environment variables](#-environment-variables) to the project settings —
-   including the server-only `SUPABASE_SERVICE_ROLE_KEY`, which the console needs for the user
-   directory and Promote/Demote.
-4. Deploy — the 5-minute stream-health cron is already declared in `vercel.json`.
-5. Run **both** migrations once against your production Supabase project, in order:
-   `20261018120000_security_hardening.sql`, then `20261019000000_profiles_roles.sql`.
-6. Promote your first administrator with the bootstrap statement in
-   [Roles & Access Control](#-roles--access-control-rbac), then sign out and back in.
-
----
 
 ## 📄 License & Credits
 
